@@ -11,7 +11,7 @@ import type { Upstream } from "./helpers/upstream.js";
 let tmp: string;
 let upstream: Upstream;
 beforeAll(async () => {
-  tmp = mkdtempSync(join(tmpdir(), "ctxlint-cli-"));
+  tmp = mkdtempSync(join(tmpdir(), "tokenwire-cli-"));
   upstream = await startUpstream();
 });
 afterAll(async () => {

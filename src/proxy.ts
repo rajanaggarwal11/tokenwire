@@ -55,13 +55,13 @@ export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
 
   const server = http.createServer((req, res) => {
     const started = Date.now();
-    const url = new URL(req.url ?? "/", "http://ctxlint.invalid");
+    const url = new URL(req.url ?? "/", "http://tokenwire.invalid");
     const [name, ...rest] = url.pathname.split("/").filter(Boolean);
     const base = name ? upstreams[name] : undefined;
     if (!name || !base) {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end(
-        `ctxlint: no upstream named "${name ?? ""}". Known: ${Object.keys(upstreams).join(", ")}. ` +
+        `tokenwire: no upstream named "${name ?? ""}". Known: ${Object.keys(upstreams).join(", ")}. ` +
           `Point your SDK at ${`http://127.0.0.1:${(server.address() as { port: number }).port}/<name>`}.\n`,
       );
       return;
@@ -146,7 +146,7 @@ export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
 
     upstreamReq.on("error", (err) => {
       if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-      res.end(`ctxlint: upstream "${name}" (${target.origin}) is unreachable: ${err.message}\n`);
+      res.end(`tokenwire: upstream "${name}" (${target.origin}) is unreachable: ${err.message}\n`);
       options.onExchange?.({
         id: randomUUID(),
         at: new Date(started).toISOString(),
