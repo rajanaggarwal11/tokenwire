@@ -1,13 +1,13 @@
-# ctxlint
+# tokenwire
 
-[![CI](https://github.com/rajanaggarwal11/ctxlint/actions/workflows/ci.yml/badge.svg)](https://github.com/rajanaggarwal11/ctxlint/actions/workflows/ci.yml) [![CodeQL](https://github.com/rajanaggarwal11/ctxlint/actions/workflows/codeql.yml/badge.svg)](https://github.com/rajanaggarwal11/ctxlint/actions/workflows/codeql.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![CI](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml) [![CodeQL](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-**What are you actually sending the model?** Every LLM app has a context window, and almost nobody can see it: the framework assembles it, the SDK sends it, the bill arrives. `ctxlint` is a local proxy that reads every request your app makes to Anthropic or OpenAI and lints it — wasted tokens, the same block sent twice, tool definitions nobody calls, prompt-cache misses and the exact character that caused them, secrets in the prompt, injection arriving through tool results, and how fast the context is growing.
+**What are you actually sending the model?** Every LLM app has a context window, and almost nobody can see it: the framework assembles it, the SDK sends it, the bill arrives. `tokenwire` is a local proxy that reads every request your app makes to Anthropic or OpenAI and lints it — wasted tokens, the same block sent twice, tool definitions nobody calls, prompt-cache misses and the exact character that caused them, secrets in the prompt, injection arriving through tool results, and how fast the context is growing.
 
 ```bash
-npx ctxlint wrap -- claude -p "summarise this repo"    # any command that honours ANTHROPIC_BASE_URL / OPENAI_BASE_URL
-npx ctxlint wrap -- node agent.js
-npx ctxlint                                            # a proxy that reports live; point your app at it
+npx tokenwire wrap -- claude -p "summarise this repo"    # any command that honours ANTHROPIC_BASE_URL / OPENAI_BASE_URL
+npx tokenwire wrap -- node agent.js
+npx tokenwire                                            # a proxy that reports live; point your app at it
 ```
 
 **It never modifies a request or a response, and the record never contains a credential.** Not a dashboard — a linter.
@@ -15,15 +15,15 @@ npx ctxlint                                            # a proxy that reports li
 Here is Claude Code doing a small task (read three files, grep, `git log`), through the proxy:
 
 ```
-$ ctxlint wrap -- claude -p "Read src/proxy.ts, src/exchange.ts and src/context.ts …" --model haiku
-ctxlint · proxy on http://127.0.0.1:54580 · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: claude -p … --model haiku
+$ tokenwire wrap -- claude -p "Read src/proxy.ts, src/exchange.ts and src/context.ts …" --model haiku
+tokenwire · proxy on http://127.0.0.1:54580 · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: claude -p … --model haiku
   #1 HEAD anthropic/api/hello  200 not a chat request 0.3s
   #2 POST anthropic/v1/messages claude-haiku-4-5-20251001 200 966 in · 15 out 1.1s
   #3 POST anthropic/v1/messages claude-haiku-4-5-20251001 200 35,760 in (32,452 cached) · 396 out 4.2s
   #4 POST anthropic/v1/messages claude-haiku-4-5-20251001 200 46,557 in (35,750 cached) · 92 out 1.9s
   #5 POST anthropic/v1/messages claude-haiku-4-5-20251001 200 46,743 in (46,549 cached) · 522 out 6.0s
 
-ctxlint · 4 requests · claude-haiku-4-5-20251001 · ctxlint.session.jsonl
+tokenwire · 4 requests · claude-haiku-4-5-20251001 · tokenwire.session.jsonl
 
  turn      input   cache r/w   output   system   tools   history  model
     1        966           —       15      87%      0%       13%  claude-haiku-4-5-20251001
@@ -57,11 +57,11 @@ Every turn after the warm-up is 56–73% tool definitions — 29 of them, 27 of 
 | `cache-miss`               | warn     | Anthropic: `cache_control` is on and `cache_read_input_tokens` is 0 — names the section and the first character where the prefix changed (`Current time: 14:02` → `14:03`).                                                                                                                               |
 | `oversized-system`         | info     | The system prompt is 60%+ of the request.                                                                                                                                                                                                                                                                 |
 
-`ctxlint --list-rules` prints the same. Money rules are warnings; security rules are errors; `--strict` makes warnings fail the build.
+`tokenwire --list-rules` prints the same. Money rules are warnings; security rules are errors; `--strict` makes warnings fail the build.
 
 ## Anatomy of a Claude Code turn
 
-`ctxlint report --sections` lists every section of the last request, largest first. The same session as above (Claude Code 2.1.270, `claude-haiku-4-5`, 2026-09-14):
+`tokenwire report --sections` lists every section of the last request, largest first. The same session as above (Claude Code 2.1.270, `claude-haiku-4-5`, 2026-09-14):
 
 ```
 sections of turn 4, largest first
@@ -83,25 +83,25 @@ The system prompt is 6,740 tokens and carries `cache_control`; the 29 tool defin
 ## How it works
 
 ```
-your app ──(ANTHROPIC_BASE_URL / OPENAI_BASE_URL)──▶ ctxlint :port ──▶ api.anthropic.com / api.openai.com
+your app ──(ANTHROPIC_BASE_URL / OPENAI_BASE_URL)──▶ tokenwire :port ──▶ api.anthropic.com / api.openai.com
                                                           │
                                                           ├─ records request + response usage (credentials stripped)
                                                           ├─ lints after every request, prints what is new
-                                                          └─ ctxlint.session.jsonl
+                                                          └─ tokenwire.session.jsonl
 ```
 
 - **The wire is untouched.** Requests go upstream exactly as received (minus hop-by-hop headers), responses come back exactly as the upstream sent them — still compressed, still chunked, still streaming. A copy of each body is decoded on the side for the record. Tests compare hashes of what was sent with what arrived.
 - **Three formats, one model.** Anthropic Messages, OpenAI Chat Completions and OpenAI Responses parse to the same ordered list of sections — system, tool definitions, user, assistant, tool results — each with its turn, a hash, and its `cache_control` marker.
 - **Numbers.** Totals come from the provider's own `usage` and are exact. Per-section numbers are tokenizer estimates scaled so they sum to that exact total; when a response carried no usage (an OpenAI stream without `stream_options.include_usage`), the report says `≈` and never injects the option to get it.
-- **The record.** One exchange per line in `ctxlint.session.jsonl`, local, credentials replaced with `[stripped]` before the line is written. `--no-record` keeps nothing. The record does hold the content of your requests — that is what gets linted.
+- **The record.** One exchange per line in `tokenwire.session.jsonl`, local, credentials replaced with `[stripped]` before the line is written. `--no-record` keeps nothing. The record does hold the content of your requests — that is what gets linted.
 
 ## In CI
 
 Record a scenario, then check it:
 
 ```yaml
-- run: npx ctxlint wrap --session agent.jsonl -- node test/agent-scenario.js
-- run: npx ctxlint check agent.jsonl --budget 60k --strict
+- run: npx tokenwire wrap --session agent.jsonl -- node test/agent-scenario.js
+- run: npx tokenwire check agent.jsonl --budget 60k --strict
 ```
 
 Exit codes are stable: `0` nothing to report · `1` findings remain (errors, or warnings under `--strict`) · `2` could not run. `--json` emits a stable shape (`version: 1`) with per-turn totals, section breakdowns, and findings.
@@ -109,10 +109,10 @@ Exit codes are stable: `0` nothing to report · `1` findings remain (errors, or 
 ## Options
 
 ```
-ctxlint wrap [options] -- <command> [args…]   Run a command through the proxy, then report
-ctxlint [options]                              Start the proxy and report live (Ctrl-C to finish)
-ctxlint report <session> [--sections]          Report on a recorded session
-ctxlint check <session>                        Lint a recorded session for CI — exit 0/1/2
+tokenwire wrap [options] -- <command> [args…]   Run a command through the proxy, then report
+tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
+tokenwire report <session> [--sections]          Report on a recorded session
+tokenwire check <session>                        Lint a recorded session for CI — exit 0/1/2
 
 --port <n>              --upstream <name=url>     --session <file>     --no-record     --append
 --budget <n>            --max-growth <pct>        --window <n>
@@ -124,7 +124,7 @@ ctxlint check <session>                        Lint a recorded session for CI �
 ## As a library
 
 ```ts
-import { startProxy, lintExchanges, contextOf } from "ctxlint";
+import { startProxy, lintExchanges, contextOf } from "tokenwire";
 
 const proxy = await startProxy({ onExchange: (x) => exchanges.push(x) });
 // … run your app with proxy.env …
