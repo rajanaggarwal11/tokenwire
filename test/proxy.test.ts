@@ -18,7 +18,7 @@ let tmp: string;
 const exchanges: Exchange[] = [];
 
 beforeAll(async () => {
-  tmp = mkdtempSync(join(tmpdir(), "ctxlint-proxy-"));
+  tmp = mkdtempSync(join(tmpdir(), "tokenwire-proxy-"));
   upstream = await startUpstream();
   proxy = await startProxy({
     upstreams: { anthropic: upstream.url, openai: upstream.url, dead: "http://127.0.0.1:1" },

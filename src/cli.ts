@@ -20,13 +20,13 @@ const EXIT_FINDINGS = 1;
 const EXIT_ERROR = 2;
 
 const HELP = `
-ctxlint — what are you actually sending the model?
+tokenwire — what are you actually sending the model?
 
 Usage
-  ctxlint wrap [options] -- <command> [args…]   Run a command through the proxy, then report
-  ctxlint [options]                              Start the proxy and report live (Ctrl-C to finish)
-  ctxlint report <session> [options]             Report on a recorded session
-  ctxlint check <session> [options]              Lint a recorded session for CI — exit 0/1/2
+  tokenwire wrap [options] -- <command> [args…]   Run a command through the proxy, then report
+  tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
+  tokenwire report <session> [options]             Report on a recorded session
+  tokenwire check <session> [options]              Lint a recorded session for CI — exit 0/1/2
 
 Proxy options
   --port <n>              Listen on this port (default: a free one)
@@ -225,10 +225,10 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
   if (wrap) {
     const [cmd, ...args] = p.child;
     if (!cmd)
-      throw new UsageError("wrap needs a command after --, e.g. ctxlint wrap -- node agent.js");
+      throw new UsageError("wrap needs a command after --, e.g. tokenwire wrap -- node agent.js");
     out(
       pc.dim(
-        `ctxlint · proxy on ${proxy.url} · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: ${[cmd, ...args].join(" ")}\n`,
+        `tokenwire · proxy on ${proxy.url} · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: ${[cmd, ...args].join(" ")}\n`,
       ),
     );
     const code = await new Promise<number>((resolveCode) => {
@@ -244,7 +244,7 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
   }
 
   out(
-    `${pc.bold("ctxlint")} ${pc.dim(`· proxy on ${proxy.url} · recording to ${sessionPath ?? "nowhere (--no-record)"}`)}\n\n` +
+    `${pc.bold("tokenwire")} ${pc.dim(`· proxy on ${proxy.url} · recording to ${sessionPath ?? "nowhere (--no-record)"}`)}\n\n` +
       `  export ANTHROPIC_BASE_URL=${proxy.env.ANTHROPIC_BASE_URL}\n  export OPENAI_BASE_URL=${proxy.env.OPENAI_BASE_URL}\n\n` +
       pc.dim("  Run your app in another shell. Ctrl-C here for the report.\n\n"),
   );
@@ -264,7 +264,7 @@ function runOnSession(p: Parsed): number {
   const path = resolve(file);
   if (!existsSync(path))
     throw new UsageError(
-      `no session file at ${file}. Record one with 'ctxlint wrap -- <command>'.`,
+      `no session file at ${file}. Record one with 'tokenwire wrap -- <command>'.`,
     );
   const result = lintExchanges(readSession(path), lintOptions(p));
   if (p.values.json) process.stdout.write(JSON.stringify(toJson(result, file), null, 2) + "\n");

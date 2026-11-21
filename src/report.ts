@@ -130,7 +130,7 @@ export function renderSummary(findings: Finding[]): string {
 
 export function renderReport(result: LintResult, title: string, sections = false): string {
   const models = [...new Set(result.turns.map((t) => t.context.model).filter(Boolean))];
-  const head = `${pc.bold("ctxlint")}${pc.dim(` · ${result.turns.length} request${result.turns.length === 1 ? "" : "s"}${models.length ? ` · ${models.join(", ")}` : ""} · ${title}`)}\n`;
+  const head = `${pc.bold("tokenwire")}${pc.dim(` · ${result.turns.length} request${result.turns.length === 1 ? "" : "s"}${models.length ? ` · ${models.join(", ")}` : ""} · ${title}`)}\n`;
   const tools = renderTools(result.turns);
   return `${head}
 ${renderTurns(result.turns)}${

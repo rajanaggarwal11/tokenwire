@@ -1,6 +1,6 @@
 # Security
 
-`ctxlint` is a local proxy that sits between your application and Anthropic or OpenAI, and a
+`tokenwire` is a local proxy that sits between your application and Anthropic or OpenAI, and a
 linter over what passes through it. Three things about it are security-relevant, and each is
 tested:
 
@@ -9,13 +9,13 @@ tested:
 - **The record never contains a credential.** Every `authorization`, `x-api-key`, `api-key`,
   `cookie` and similar header is replaced with `[stripped]` before an exchange exists. The
   record does contain the _content_ of requests — that is what gets linted — and it stays on
-  your machine (`ctxlint.session.jsonl`; `--no-record` keeps nothing).
+  your machine (`tokenwire.session.jsonl`; `--no-record` keeps nothing).
 - **It listens on 127.0.0.1 only**, on a free port, for the life of the command.
 
 ## Reporting
 
 Please report privately through GitHub's
-[security advisory form](https://github.com/rajanaggarwal11/ctxlint/security/advisories/new)
+[security advisory form](https://github.com/rajanaggarwal11/tokenwire/security/advisories/new)
 rather than a public issue, for anything like:
 
 - A way the proxy could alter, drop or reorder what the model receives or what the client
