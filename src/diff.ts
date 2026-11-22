@@ -1,3 +1,4 @@
+import { REDACTED } from "./rules/patterns.js";
 import type { Snapshot, SnapshotSection, SnapshotTurn } from "./snapshot.js";
 
 /** First index at which two strings differ, or -1 when equal. */
@@ -55,6 +56,8 @@ export interface TextChange {
   now: string;
   /** The change is a timestamp or id: it will differ on every run. */
   volatile: boolean;
+  /** The change is inside a redacted secret: `was` and `now` are its placeholder. */
+  redacted?: true;
 }
 
 export interface ToolChange {
@@ -84,6 +87,8 @@ export interface CacheBreak {
   now?: string;
   /** The change is a timestamp or id rendered in on every request. */
   volatile: boolean;
+  /** The change is inside a redacted secret; `was` and `now`, when set, are its placeholder. */
+  redacted?: true;
   /** Tokens from the break onward that the earlier request had and this one re-sends uncached. */
   tokens: number;
 }
@@ -140,6 +145,30 @@ const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
 const isPrefixKind = (s: SnapshotSection) => s.kind === "system" || s.kind === "tool-def";
 
 /** Index of the first conversation section: everything before it is the static prefix. */
+/**
+ * Two sections whose redacted text is identical but whose hashes differ: the change is
+ * inside a redacted secret. `marker` is that secret's placeholder when it is known
+ * which one changed: there is only one, or both sides carry fingerprints (a session,
+ * not a committed snapshot). Otherwise it says how many it could be, and `at` is the
+ * first of them.
+ */
+function insideSecret(
+  was: SnapshotSection,
+  now: SnapshotSection,
+): { at: number; marker: string } | null {
+  if (was.text === undefined || was.text !== now.text || was.hash === now.hash) return null;
+  const markers = [...was.text.matchAll(REDACTED)];
+  if (!markers.length) return null;
+  let k = markers.length === 1 ? 0 : -1;
+  if (was.secrets && now.secrets && was.secrets.length === now.secrets.length)
+    k = was.secrets.findIndex((h, i) => h !== now.secrets![i]);
+  const m = markers[k] ?? markers[0]!;
+  return {
+    at: m.index,
+    marker: markers[k] ? m[0] : `one of the ${markers.length} redacted secrets`,
+  };
+}
+
 export function prefixLength(sections: SnapshotSection[]): number {
   const i = sections.findIndex((s) => !isPrefixKind(s));
   return i === -1 ? sections.length : i;
@@ -237,14 +266,21 @@ export function findCacheBreaks(snapshot: Snapshot): CacheBreak[] {
       const where = describeSection(section, inPrefix);
       const texts = was?.text !== undefined && now?.text !== undefined;
       const span = texts ? changedSpan(was!.text!, now!.text!) : null;
+      const secret = texts && !span ? insideSecret(was!, now!) : null;
       const brk: CacheBreak = {
         turn: cur.n,
         previous: prev.n,
         where,
         key: inPrefix ? where : `${where} #${p - Math.max(ep, lp) + 1}`,
         inPrefix,
-        at: span?.at ?? 0,
+        at: span?.at ?? secret?.at ?? 0,
         ...(span && inPrefix ? { was: span.was, now: span.now } : {}),
+        ...(secret
+          ? {
+              redacted: true as const,
+              ...(inPrefix ? { was: secret.marker, now: secret.marker } : {}),
+            }
+          : {}),
         volatile: texts ? volatileChange(was!.text!, now!.text!) : false,
         tokens: sum(prev.sections.map((s) => s.tokens)) - tokensBefore,
       };
@@ -306,9 +342,30 @@ export function diffSnapshots(base: Snapshot, head: Snapshot, options: DiffOptio
   const bText = textOf(prefixOf(base.turns[0]).filter((s) => s.kind === "system"));
   const hText = textOf(prefixOf(head.turns[0]).filter((s) => s.kind === "system"));
   const span = bText !== undefined && hText !== undefined ? changedSpan(bText, hText) : null;
-  const systemChange: TextChange | null = span
+  let systemChange: TextChange | null = span
     ? { ...span, volatile: volatileChange(bText!, hText!) }
     : null;
+  if (!span && bText !== undefined && bText === hText) {
+    // Same redacted text, different hashes: the change is inside a secret.
+    const bSys = prefixOf(base.turns[0]).filter((s) => s.kind === "system");
+    const hSys = prefixOf(head.turns[0]).filter((s) => s.kind === "system");
+    let offset = 0;
+    for (let i = 0; i < Math.min(bSys.length, hSys.length); i++) {
+      const secret = insideSecret(bSys[i]!, hSys[i]!);
+      if (secret) {
+        const at = offset + secret.at;
+        systemChange = {
+          at,
+          was: secret.marker,
+          now: secret.marker,
+          volatile: false,
+          redacted: true,
+        };
+        break;
+      }
+      offset += (bSys[i]!.text?.length ?? 0) + 1;
+    }
+  }
 
   const bTools = toolDefs(base.turns[0]);
   const hTools = toolDefs(head.turns[0]);

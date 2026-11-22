@@ -75,20 +75,37 @@ export function excerpt(text: string, index: number, length: number): string {
   return `${start > 0 ? "…" : ""}${text.slice(start, end).replace(/\s+/g, " ")}${end < text.length ? "…" : ""}`;
 }
 
+/** How a redacted secret reads in text that leaves the record. */
+export const REDACTED = /\[redacted: [^\]]+\]/g;
+
 /**
  * The text with everything `secret-in-context` would flag replaced by
- * `[redacted: <what>]`. Used wherever text leaves the local record, such as a
- * snapshot meant to be committed.
+ * `[redacted: <what>]`, and the secrets that were removed, in the order their
+ * placeholders appear. Used wherever text leaves the local record, such as a snapshot
+ * meant to be committed. Where two patterns overlap, the one that starts first wins.
  */
-export function redactSecrets(text: string): string {
-  let out = text;
+export function redact(text: string): { text: string; secrets: string[] } {
+  const found: { start: number; end: number; what: string }[] = [];
   for (const { pattern, what, extent } of SECRET_PATTERNS) {
-    if (!pattern.test(out)) continue;
+    if (!pattern.test(text)) continue;
     const re = extent ?? pattern;
-    out = out.replace(
-      new RegExp(re.source, `${re.flags.replace("g", "")}g`),
-      `[redacted: ${what}]`,
-    );
+    for (const m of text.matchAll(new RegExp(re.source, `${re.flags.replace("g", "")}g`)))
+      if (m[0].length) found.push({ start: m.index, end: m.index + m[0].length, what });
   }
-  return out;
+  if (!found.length) return { text, secrets: [] };
+  found.sort((a, b) => a.start - b.start || b.end - a.end);
+  let out = "";
+  let at = 0;
+  const secrets: string[] = [];
+  for (const f of found) {
+    if (f.start < at) continue;
+    out += `${text.slice(at, f.start)}[redacted: ${f.what}]`;
+    secrets.push(text.slice(f.start, f.end));
+    at = f.end;
+  }
+  return { text: out + text.slice(at), secrets };
+}
+
+export function redactSecrets(text: string): string {
+  return redact(text).text;
 }

@@ -21,14 +21,21 @@ const quote = (s: string, max = 60) => {
 export const COMMENT_MARKER = "<!-- tokenwire-diff -->";
 
 function changeLine(c: TextChange): string {
+  if (c.redacted)
+    return c.was.startsWith("[")
+      ? `changed inside ${c.was} at char ${fmt(c.at)}`
+      : `changed inside ${c.was}, the first at char ${fmt(c.at)}`;
   const what = c.volatile ? "a value that changes every run" : "changed";
   return `${what} at char ${fmt(c.at)}: "${quote(c.was)}" → "${quote(c.now)}"`;
 }
 
 function breakLine(b: CacheBreak): string {
   // Only the system prompt and tool definitions are quoted; conversation text never is.
-  const q =
-    b.inPrefix && b.was !== undefined && b.now !== undefined
+  const q = b.redacted
+    ? b.was?.startsWith("[")
+      ? `, inside ${b.was} at char ${fmt(b.at)}`
+      : `, inside ${b.was ?? "a redacted secret"}, the first at char ${fmt(b.at)}`
+    : b.inPrefix && b.was !== undefined && b.now !== undefined
       ? `, char ${fmt(b.at)}: "${quote(b.was)}" → "${quote(b.now)}"`
       : "";
   const why = b.volatile ? " (a timestamp or id rendered in on every request)" : "";
