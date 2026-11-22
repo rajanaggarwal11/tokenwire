@@ -25,7 +25,7 @@ const EXIT_FINDINGS = 1;
 const EXIT_ERROR = 2;
 
 const HELP = `
-tokenwire — what are you actually sending the model?
+tokenwire — see what your app sends to Anthropic or OpenAI, and lint it
 
 Usage
   tokenwire wrap [options] -- <command> [args…]   Run a command through the proxy, then report
