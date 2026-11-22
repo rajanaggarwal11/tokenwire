@@ -238,3 +238,109 @@ describe("wrap", () => {
     expect(r.stderr).toContain("could not start");
   });
 });
+
+describe("CI mode: wrap --offline, snapshot, diff", () => {
+  const scenario = (extra: string) => `
+    const base = process.env.ANTHROPIC_BASE_URL;
+    const tools = [{ name: "get_invoice", description: "Fetch an invoice", input_schema: { type: "object" } }${extra}];
+    const ask = (system, messages) => fetch(base + "/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "sk-ant-not-real" },
+      body: JSON.stringify({ model: "claude-sonnet-5", max_tokens: 64, system, tools, messages }),
+    }).then((r) => r.json());
+    const first = await ask("You are the billing assistant.", [{ role: "user", content: "hi" }]);
+    if (first.stop_reason !== "end_turn") process.exit(9);
+  `;
+  const record = (name: string, extra = "") =>
+    cli(
+      "wrap",
+      "--offline",
+      "--session",
+      join(tmp, name),
+      "--",
+      process.execPath,
+      "--input-type=module",
+      "-e",
+      scenario(extra),
+    );
+
+  it("records offline, snapshots, and diffs a change", async () => {
+    const base = await record("ci-base.jsonl");
+    expect(base.code).toBe(0);
+    expect(base.stderr).toContain("offline capture — nothing is sent upstream");
+    const snapPath = join(tmp, "tokenwire.snapshot.json");
+    const s = await cli("snapshot", join(tmp, "ci-base.jsonl"), "-o", snapPath);
+    expect(s.code).toBe(0);
+    expect(s.stderr).toContain("1 request");
+
+    expect((await cli("diff", snapPath, join(tmp, "ci-base.jsonl"))).code).toBe(0);
+
+    await record(
+      "ci-head.jsonl",
+      `, { name: "search_kb", description: "${"Search the knowledge base. ".repeat(20)}", input_schema: { type: "object" } }`,
+    );
+    const md = await cli(
+      "diff",
+      snapPath,
+      join(tmp, "ci-head.jsonl"),
+      "--format",
+      "markdown",
+      "--max-increase",
+      "10%",
+    );
+    expect(md.code).toBe(1);
+    expect(md.stdout).toContain("<!-- tokenwire-diff -->");
+    expect(md.stdout).toContain("`search_kb`");
+    expect(md.stdout).toMatch(/over the 10% limit/);
+
+    const json = await cli("diff", snapPath, join(tmp, "ci-head.jsonl"), "--format", "json");
+    expect(json.code).toBe(0);
+    expect(JSON.parse(json.stdout)).toMatchObject({
+      version: 1,
+      tools: { added: [{ name: "search_kb" }] },
+    });
+  }, 30_000);
+
+  it("refuses bad diff options and a missing baseline", async () => {
+    expect((await cli("diff")).code).toBe(2);
+    expect((await cli("diff", join(tmp, "nope.json"))).stderr).toContain("no snapshot or session");
+    const s = join(tmp, "ci-base.jsonl");
+    expect((await cli("diff", s, s, "--runs-per-day", "100")).stderr).toContain(
+      "--runs-per-day needs --price",
+    );
+    expect((await cli("diff", s, s, "--format", "html")).code).toBe(2);
+    expect((await cli("diff", s, s, "--max-increase", "lots")).code).toBe(2);
+    expect(
+      (await cli("wrap", "--reply", "x", "--no-record", "--", process.execPath, "-e", "0")).stderr,
+    ).toContain("--reply only applies with --offline");
+  });
+});
+
+describe("CI mode: a run that measured nothing", () => {
+  it("is an error, not a saving", async () => {
+    const base = join(tmp, "ci-base.jsonl");
+    const empty = join(tmp, "empty.jsonl");
+    await cli("wrap", "--offline", "--session", empty, "--", process.execPath, "-e", "0");
+    const r = await cli("diff", base, empty);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("has no chat requests");
+  });
+});
+
+describe("CI mode: a typo must not pass a gate", () => {
+  it("rejects unknown options, empty values and stray arguments", async () => {
+    const s = join(tmp, "ci-base.jsonl");
+    expect((await cli("diff", s, s, "--max-incrase", "10%")).code).toBe(2);
+    expect((await cli("diff", s, s, "--max-increase", "%")).code).toBe(2);
+    expect((await cli("diff", s, s, "--price", " ")).code).toBe(2);
+    const stray = await cli("diff", s, s, "--max-increase", "10", "%");
+    expect(stray.code).toBe(2);
+    expect(stray.stderr).toContain("Quote option values");
+  });
+
+  it("wrap --offline that recorded no chat request is an error", async () => {
+    const r = await cli("wrap", "--offline", "--no-record", "--", process.execPath, "-e", "0");
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("recorded no chat requests");
+  });
+});

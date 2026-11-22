@@ -1,0 +1,5 @@
+---
+"tokenwire": minor
+---
+
+CI mode — size-limit for prompts. `wrap --offline` records exactly what your app sends without sending it: chat requests are answered locally in the format each SDK expects (Anthropic Messages, OpenAI Chat Completions and Responses, streaming or not; forced tools and structured output get schema-shaped answers), and API keys in the environment are replaced with a placeholder, so CI needs no key and costs nothing. `snapshot` writes a small baseline to commit (system prompt and tool definitions with their text; for the conversation, only kinds and token counts — no text, no hashes). `diff` compares a run against it: input tokens per run by section, tools added, removed and changed, where a request stops repeating the earlier request it continues (the prompt-cache break, to the character), timestamps or ids in the prompt that change every run, and the cost of the change. Exit 1 on a new cache break or over `--max-increase`; `--format markdown` for a PR comment, `--format json` for machines.

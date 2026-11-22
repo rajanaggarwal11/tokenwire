@@ -3,6 +3,7 @@ import https from "node:https";
 import { randomUUID } from "node:crypto";
 import { decodeBody } from "./decode.js";
 import { apiKindOf, extract, parseSse, stripCredentials } from "./exchange.js";
+import { OFFLINE_KEY, startOfflineUpstream, type OfflineUpstream } from "./offline.js";
 import type { Exchange } from "./types.js";
 
 export const DEFAULT_UPSTREAMS: Record<string, string> = {
@@ -31,6 +32,12 @@ export interface ProxyOptions {
   onExchange?: (exchange: Exchange) => void;
   /** Bodies larger than this are kept truncated in the record; the wire is unaffected. */
   maxRecordBytes?: number;
+  /**
+   * Answer chat requests locally instead of forwarding them (see offline.ts): the
+   * request is recorded exactly, nothing leaves the machine. `reply` is the assistant
+   * text every request gets back. Explicit `upstreams` are still forwarded.
+   */
+  offline?: { reply?: string };
 }
 
 export interface RunningProxy {
@@ -49,8 +56,16 @@ export interface RunningProxy {
  * decoded on the side for the record. Nothing here can change what the model
  * sees or what the client receives.
  */
-export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
-  const upstreams = { ...DEFAULT_UPSTREAMS, ...(options.upstreams ?? {}) };
+export async function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
+  let offline: OfflineUpstream | undefined;
+  if (options.offline) offline = await startOfflineUpstream(options.offline);
+  const defaults = offline
+    ? Object.fromEntries(Object.keys(DEFAULT_UPSTREAMS).map((k) => [k, offline!.url]))
+    : DEFAULT_UPSTREAMS;
+  const upstreams = { ...defaults, ...(options.upstreams ?? {}) };
+  const offlineNames = new Set(
+    offline ? Object.keys(upstreams).filter((k) => upstreams[k] === offline!.url) : [],
+  );
   const maxRecord = options.maxRecordBytes ?? 8 * 1024 * 1024;
 
   const server = http.createServer((req, res) => {
@@ -112,9 +127,13 @@ export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
           : stream
             ? parseSse(resBody.toString("utf8"))
             : parseJson(resBody.toString("utf8"));
-        const { usage, toolCalls, text } = truncated
+        const isOffline = offlineNames.has(name);
+        const extracted = truncated
           ? { usage: extract(kind, undefined, false).usage, toolCalls: [], text: "" }
           : extract(kind, responseBody, stream);
+        const { toolCalls, text } = extracted;
+        // The stand-in reports zero usage; that is not a measurement and must not read as one.
+        const usage = isOffline ? extract("other", undefined, false).usage : extracted.usage;
         const model =
           requestJson && typeof requestJson === "object" && "model" in requestJson
             ? String((requestJson as { model: unknown }).model)
@@ -140,6 +159,7 @@ export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
             text,
           },
           durationMs: Date.now() - started,
+          ...(isOffline ? { offline: true as const } : {}),
         });
       });
     });
@@ -191,11 +211,33 @@ export function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
         port,
         url,
         upstreams,
-        env: { ANTHROPIC_BASE_URL: `${url}/anthropic`, OPENAI_BASE_URL: `${url}/openai/v1` },
+        env: {
+          ANTHROPIC_BASE_URL: `${url}/anthropic`,
+          OPENAI_BASE_URL: `${url}/openai/v1`,
+          // Offline: SDKs refuse to start without a key, and a real key has no business
+          // here. A placeholder satisfies the first; replacing any real one means a
+          // request that bypasses the proxy (a hard-coded base URL, a cloud SDK) fails
+          // to authenticate instead of spending money.
+          ...(offline
+            ? {
+                ANTHROPIC_API_KEY: OFFLINE_KEY,
+                OPENAI_API_KEY: OFFLINE_KEY,
+                AZURE_OPENAI_API_KEY: OFFLINE_KEY,
+                ANTHROPIC_AUTH_TOKEN: OFFLINE_KEY,
+              }
+            : {}),
+        },
         close: () =>
           new Promise((r) => {
             server.closeAllConnections();
-            server.close(() => r());
+            server.close(() => {
+              if (offline)
+                offline.close().then(
+                  () => r(),
+                  () => r(),
+                );
+              else r();
+            });
           }),
       });
     });

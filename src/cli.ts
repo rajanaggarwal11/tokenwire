@@ -5,7 +5,10 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import pc from "picocolors";
-import { lintExchanges } from "./lint.js";
+import { diffSnapshots } from "./diff.js";
+import { lintExchanges, turnsOf } from "./lint.js";
+import { renderDiffMarkdown, renderDiffText } from "./render-diff.js";
+import { DEFAULT_SNAPSHOT, loadSnapshot, toSnapshot, writeSnapshot } from "./snapshot.js";
 import { startProxy } from "./proxy.js";
 import { renderFindings, renderReport, renderSummary, toJson } from "./report.js";
 import { ALL_RULES, RULE_IDS } from "./rules/index.js";
@@ -27,12 +30,29 @@ Usage
   tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
   tokenwire report <session> [options]             Report on a recorded session
   tokenwire check <session> [options]              Lint a recorded session for CI — exit 0/1/2
+  tokenwire snapshot [session] [-o file]           Save what a session sends, small enough to commit
+  tokenwire diff <base> [head] [options]           Compare two snapshots or sessions — exit 0/1/2
+
+In CI
+  tokenwire wrap --offline -- npm run scenario     Record what your app sends, without sending it
+  tokenwire diff tokenwire.snapshot.json --format markdown >> "$GITHUB_STEP_SUMMARY"
+  tokenwire snapshot                               Accept the change: rewrite the committed snapshot
 
 Proxy options
   --port <n>              Listen on this port (default: a free one)
   --upstream <name=url>   Add or replace an upstream; repeatable (default: anthropic, openai)
   --session <file>        Where to record (default: ${DEFAULT_SESSION}); --no-record keeps nothing
   --append                Keep an existing session file instead of starting fresh
+  --offline               Answer chat requests locally instead of forwarding them: the request is
+                          recorded exactly, nothing leaves the machine, no API key, no cost
+  --reply <text>          With --offline: the assistant text every request gets back (default: empty)
+
+Diff options
+  --max-increase <n|n%>   Fail when input tokens per run grow by more than this (e.g. 2k or 10%)
+  --price <usd>           USD per million input tokens, for a cost line
+  --runs-per-day <n>      With --price: how often the scenario runs in production
+  --format <f>            text (default), markdown (for a PR comment or job summary), or json
+  -o, --output <file>     snapshot: where to write (default: ${DEFAULT_SNAPSHOT})
 
 Lint options
   --budget <n>            Input tokens per request above which 'budget' fires
@@ -54,12 +74,13 @@ Point an SDK at it with the two variables it prints.
 
 Exit codes
   0  nothing to report (for 'wrap': the command succeeded and nothing to report)
-  1  findings remain — errors, or warnings under --strict
+  1  findings remain — errors, or warnings under --strict; for 'diff': over --max-increase,
+     or the change breaks prompt caching
   2  could not run — no session, bad option, upstream unreachable
 `.trimStart();
 
 interface Parsed {
-  command: "proxy" | "wrap" | "report" | "check";
+  command: "proxy" | "wrap" | "report" | "check" | "snapshot" | "diff";
   positionals: string[];
   child: string[];
   values: Record<string, string | boolean | string[] | undefined>;
@@ -71,7 +92,7 @@ function parse(argv: string[]): Parsed {
   const child = sep === -1 ? [] : argv.slice(sep + 1);
   const { values, positionals } = parseArgs({
     args: own,
-    strict: false,
+    strict: true,
     allowPositionals: true,
     options: {
       port: { type: "string" },
@@ -79,6 +100,13 @@ function parse(argv: string[]): Parsed {
       session: { type: "string" },
       "no-record": { type: "boolean" },
       append: { type: "boolean" },
+      offline: { type: "boolean" },
+      reply: { type: "string" },
+      "max-increase": { type: "string" },
+      price: { type: "string" },
+      "runs-per-day": { type: "string" },
+      format: { type: "string" },
+      output: { type: "string", short: "o" },
       budget: { type: "string" },
       "max-growth": { type: "string" },
       window: { type: "string" },
@@ -93,7 +121,10 @@ function parse(argv: string[]): Parsed {
     },
   });
   const first = positionals[0];
-  const command = first === "wrap" || first === "report" || first === "check" ? first : "proxy";
+  const named = ["wrap", "report", "check", "snapshot", "diff"] as const;
+  const command = (named as readonly string[]).includes(first ?? "")
+    ? (first as (typeof named)[number])
+    : "proxy";
   return {
     command,
     positionals: command === "proxy" ? positionals : positionals.slice(1),
@@ -193,9 +224,13 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
   const opts = lintOptions(p);
   const out = (s: string) => process.stderr.write(s);
 
+  const offline = !!p.values.offline;
+  if (!offline && p.values.reply !== undefined)
+    throw new UsageError("--reply only applies with --offline");
   const proxy = await startProxy({
     port: int(p.values.port, "--port"),
     upstreams: upstreams(p.values.upstream),
+    ...(offline ? { offline: { reply: str(p.values.reply) ?? "" } } : {}),
     onExchange: (x) => {
       exchanges.push(x);
       if (sessionPath) appendExchange(sessionPath, x);
@@ -219,6 +254,15 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
     const title = sessionPath ?? "not recorded";
     if (p.values.json) process.stdout.write(JSON.stringify(toJson(result, title), null, 2) + "\n");
     else process.stdout.write("\n" + renderReport(result, title, !!p.values.sections));
+    if (offline && wrap && result.turns.length === 0) {
+      // An offline capture that captured nothing measured nothing; passing would hide it.
+      out(
+        pc.red(
+          "✗ --offline recorded no chat requests. Does the command call an LLM, and does its SDK read ANTHROPIC_BASE_URL / OPENAI_BASE_URL?\n",
+        ),
+      );
+      return EXIT_ERROR;
+    }
     return exitFor(result.findings, !!p.values.strict);
   };
 
@@ -228,7 +272,7 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
       throw new UsageError("wrap needs a command after --, e.g. tokenwire wrap -- node agent.js");
     out(
       pc.dim(
-        `tokenwire · proxy on ${proxy.url} · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: ${[cmd, ...args].join(" ")}\n`,
+        `tokenwire · ${offline ? "offline capture — nothing is sent upstream" : `proxy on ${proxy.url}`} · ANTHROPIC_BASE_URL and OPENAI_BASE_URL set for: ${[cmd, ...args].join(" ")}\n`,
       ),
     );
     const code = await new Promise<number>((resolveCode) => {
@@ -274,6 +318,81 @@ function runOnSession(p: Parsed): number {
   return exitFor(result.findings, !!p.values.strict);
 }
 
+function number(v: unknown, flag: string): number | undefined {
+  const s = str(v);
+  if (s === undefined) return undefined;
+  const t = s.trim().replace(/^\$/, "");
+  const n = t === "" ? NaN : Number(t);
+  if (!Number.isFinite(n) || n < 0)
+    throw new UsageError(`${flag} expects a non-negative number, got "${s}"`);
+  return n;
+}
+
+function runSnapshot(p: Parsed): number {
+  const file = p.positionals[0] ?? DEFAULT_SESSION;
+  if (!existsSync(resolve(file)))
+    throw new UsageError(
+      `no session file at ${file}. Record one with 'tokenwire wrap --offline -- <command>'.`,
+    );
+  const turns = turnsOf(readSession(resolve(file)));
+  if (!turns.length) throw new UsageError(`${file} has no chat requests to snapshot`);
+  const out = str(p.values.output) ?? DEFAULT_SNAPSHOT;
+  writeSnapshot(resolve(out), toSnapshot(turns));
+  const total = turns.reduce((a, t) => a + t.context.totalTokens, 0);
+  process.stderr.write(
+    `${pc.green("✓")} wrote ${out} — ${turns.length} request${turns.length === 1 ? "" : "s"}, ${fmt(total)} input tokens per run\n`,
+  );
+  return EXIT_OK;
+}
+
+function runDiff(p: Parsed): number {
+  if (p.positionals.length > 2)
+    throw new UsageError(
+      `diff takes a baseline and at most one more file, got: ${p.positionals.join(" ")}. Quote option values with spaces ("10%", not 10 %).`,
+    );
+  const [baseFile, headFile = DEFAULT_SESSION] = p.positionals;
+  if (!baseFile)
+    throw new UsageError("diff needs a baseline: tokenwire diff tokenwire.snapshot.json [session]");
+  const limit = str(p.values["max-increase"]);
+  const pctLimit = limit?.trim().endsWith("%")
+    ? number(limit.trim().slice(0, -1), "--max-increase")
+    : undefined;
+  const tokenLimit =
+    limit !== undefined && pctLimit === undefined ? int(limit, "--max-increase") : undefined;
+  const runsPerDay = int(p.values["runs-per-day"], "--runs-per-day");
+  const price = number(p.values.price, "--price");
+  if (runsPerDay !== undefined && price === undefined)
+    throw new UsageError("--runs-per-day needs --price");
+  const format = str(p.values.format) ?? (p.values.json ? "json" : "text");
+  if (!["text", "markdown", "json"].includes(format))
+    throw new UsageError(`--format expects text, markdown or json, got "${format}"`);
+
+  const base = loadSnapshot(resolve(baseFile));
+  const head = loadSnapshot(resolve(headFile), "all");
+  // A run that recorded nothing would diff as a huge saving and pass. Measuring nothing
+  // is a broken check, not a good result.
+  for (const [file, s] of [
+    [baseFile, base],
+    [headFile, head],
+  ] as const) {
+    if (!s.turns.length)
+      throw new UsageError(
+        `${file} has no chat requests. Did the scenario run under 'tokenwire wrap', and does its SDK read ANTHROPIC_BASE_URL / OPENAI_BASE_URL?`,
+      );
+  }
+  const diff = diffSnapshots(base, head, {
+    ...(pctLimit !== undefined ? { maxIncreasePct: pctLimit } : {}),
+    ...(tokenLimit !== undefined ? { maxIncreaseTokens: tokenLimit } : {}),
+    ...(price !== undefined ? { pricePerMTok: price } : {}),
+    ...(runsPerDay !== undefined ? { runsPerDay } : {}),
+  });
+  if (format === "json")
+    process.stdout.write(JSON.stringify({ version: 1, ...diff }, null, 2) + "\n");
+  else if (format === "markdown") process.stdout.write(renderDiffMarkdown(diff));
+  else process.stdout.write(renderDiffText(diff));
+  return diff.failures.length ? EXIT_FINDINGS : EXIT_OK;
+}
+
 export async function run(argv: string[]): Promise<number> {
   let p: Parsed;
   try {
@@ -291,6 +410,8 @@ export async function run(argv: string[]): Promise<number> {
       return EXIT_OK;
     }
     if (p.command === "report" || p.command === "check") return runOnSession(p);
+    if (p.command === "snapshot") return runSnapshot(p);
+    if (p.command === "diff") return runDiff(p);
     return await runProxy(p, p.command === "wrap");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
