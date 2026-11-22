@@ -255,3 +255,15 @@ describe("--offline answers what the request demands", () => {
     await online.close();
   });
 });
+
+describe("sampleFromSchema bounds", () => {
+  it("never builds a huge value because a request's schema asks for one", async () => {
+    const { sampleFromSchema } = await import("../src/offline.js");
+    expect((sampleFromSchema({ type: "string", minLength: 1e9 }) as string).length).toBe(64);
+    expect(
+      (sampleFromSchema({ type: "array", items: { type: "integer" }, minItems: 1e9 }) as unknown[])
+        .length,
+    ).toBe(64);
+    expect(sampleFromSchema({ type: "string", minLength: -5 })).toBe("");
+  });
+});
