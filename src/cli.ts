@@ -1,20 +1,22 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { constants } from "node:os";
 import { existsSync, realpathSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import pc from "picocolors";
 import { diffSnapshots } from "./diff.js";
-import { lintExchanges, turnsOf } from "./lint.js";
+import { addTurn, incompleteOf, lintExchanges, lintTurns } from "./lint.js";
 import { renderDiffMarkdown, renderDiffText } from "./render-diff.js";
-import { DEFAULT_SNAPSHOT, loadSnapshot, toSnapshot, writeSnapshot } from "./snapshot.js";
+import { DEFAULT_SNAPSHOT, fromSession, loadSnapshot, writeSnapshot } from "./snapshot.js";
 import { startProxy } from "./proxy.js";
-import { renderFindings, renderReport, renderSummary, toJson } from "./report.js";
+import { renderFindings, renderIncomplete, renderReport, renderSummary, toJson } from "./report.js";
 import { ALL_RULES, RULE_IDS } from "./rules/index.js";
 import type { Finding, RuleId } from "./rules/index.js";
 import { fmt } from "./rules/types.js";
 import { appendExchange, DEFAULT_SESSION, readSession } from "./session.js";
+import type { Turn } from "./rules/index.js";
 import type { Exchange } from "./types.js";
 import { VERSION } from "./version.js";
 
@@ -28,8 +30,8 @@ tokenwire — what are you actually sending the model?
 Usage
   tokenwire wrap [options] -- <command> [args…]   Run a command through the proxy, then report
   tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
-  tokenwire report <session> [options]             Report on a recorded session
-  tokenwire check <session> [options]              Lint a recorded session for CI — exit 0/1/2
+  tokenwire report [session] [options]             Report on a recorded session
+  tokenwire check [session] [options]              Lint a recorded session for CI — exit 0/1/2
   tokenwire snapshot [session] [-o file]           Save what a session sends, small enough to commit
   tokenwire diff <base> [head] [options]           Compare two snapshots or sessions — exit 0/1/2
 
@@ -49,7 +51,8 @@ Proxy options
 
 Diff options
   --max-increase <n|n%>   Fail when input tokens per run grow by more than this (e.g. 2k or 10%)
-  --price <usd>           USD per million input tokens, for a cost line
+  --price <usd>           Your USD per million input tokens, for a cost line (offline counts
+                          are o200k estimates, so the cost is too)
   --runs-per-day <n>      With --price: how often the scenario runs in production
   --format <f>            text (default), markdown (for a PR comment or job summary), or json
   -o, --output <file>     snapshot: where to write (default: ${DEFAULT_SNAPSHOT})
@@ -76,8 +79,41 @@ Exit codes
   0  nothing to report (for 'wrap': the command succeeded and nothing to report)
   1  findings remain — errors, or warnings under --strict; for 'diff': over --max-increase,
      or the change breaks prompt caching
-  2  could not run — no session, bad option, upstream unreachable
+  2  could not run — no session, unknown command or option, upstream unreachable
 `.trimStart();
+
+const COMMANDS = ["wrap", "report", "check", "snapshot", "diff"] as const;
+
+/** Edit distance, for "did you mean". Commands are short; the quadratic table is fine. */
+function distance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(
+        prev[j]! + 1,
+        cur[j - 1]! + 1,
+        prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+function closest(word: string, options: readonly string[]): string | undefined {
+  const w = word.toLowerCase();
+  // A prefix says more than an edit distance: "snap" is short for "snapshot", not a typo of "wrap".
+  const prefixed = options.filter((o) => o.startsWith(w) || w.startsWith(o));
+  if (prefixed.length === 1) return prefixed[0];
+  let best: { option: string; d: number } | undefined;
+  for (const option of options) {
+    const d = distance(w, option);
+    if (!best || d < best.d) best = { option, d };
+  }
+  return best && best.d <= Math.max(1, Math.floor(best.option.length / 2))
+    ? best.option
+    : undefined;
+}
 
 interface Parsed {
   command: "proxy" | "wrap" | "report" | "check" | "snapshot" | "diff";
@@ -121,10 +157,23 @@ function parse(argv: string[]): Parsed {
     },
   });
   const first = positionals[0];
-  const named = ["wrap", "report", "check", "snapshot", "diff"] as const;
-  const command = (named as readonly string[]).includes(first ?? "")
-    ? (first as (typeof named)[number])
-    : "proxy";
+  // No command starts the proxy. Anything else must be a command: a typo such as
+  // "tokenwire chek" would otherwise start a proxy that never exits, and empty the
+  // session file the user meant to check.
+  if (first !== undefined && !(COMMANDS as readonly string[]).includes(first)) {
+    const near = closest(first, COMMANDS);
+    throw new UsageError(
+      `unknown command "${first}".${near ? ` Did you mean "${near}"?` : ""} Commands: ${COMMANDS.join(", ")}. ` +
+        "Run 'tokenwire' with no command to start the proxy, or 'tokenwire --help'.",
+    );
+  }
+  const command = (first as (typeof COMMANDS)[number] | undefined) ?? "proxy";
+  // "tokenwire -- node app.js" forgot the command: without this it starts a proxy that
+  // never exits, and empties the session file.
+  if (child.length && command !== "wrap")
+    throw new UsageError(
+      `only 'wrap' runs a command. Did you mean: tokenwire wrap ${own.join(" ")}${own.length ? " " : ""}-- ${child.join(" ")}`,
+    );
   return {
     command,
     positionals: command === "proxy" ? positionals : positionals.slice(1),
@@ -218,8 +267,11 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
   const sessionPath = p.values["no-record"]
     ? undefined
     : resolve(str(p.values.session) ?? DEFAULT_SESSION);
-  if (sessionPath && !p.values.append) writeFileSync(sessionPath, "");
   const exchanges: Exchange[] = [];
+  // Built once per exchange as it arrives; re-parsing the whole session on every request
+  // made live mode quadratic.
+  const turns: Turn[] = [];
+  const incomplete: string[] = [];
   const seen = new Set<string>();
   const opts = lintOptions(p);
   const out = (s: string) => process.stderr.write(s);
@@ -233,10 +285,14 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
     ...(offline ? { offline: { reply: str(p.values.reply) ?? "" } } : {}),
     onExchange: (x) => {
       exchanges.push(x);
+      addTurn(turns, x);
       if (sessionPath) appendExchange(sessionPath, x);
       out(oneLine(x, exchanges.length) + "\n");
+      const gaps = incompleteOf(x, exchanges.length);
+      incomplete.push(...gaps);
+      if (gaps.length) out(renderIncomplete(gaps));
       // Live: only findings that are new since the last request.
-      const fresh = lintExchanges(exchanges, opts).findings.filter((f) => {
+      const fresh = lintTurns(turns, opts).findings.filter((f) => {
         const key = `${f.rule}|${f.message}`;
         if (seen.has(key)) return false;
         seen.add(key);
@@ -245,12 +301,14 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
       if (fresh.length) out(renderFindings(fresh));
     },
   });
+  // Only now that the proxy is up: a bad option must not cost the user their last session.
+  if (sessionPath && !p.values.append) writeFileSync(sessionPath, "");
 
   const finish = async (): Promise<number> => {
     // The last exchange is recorded after the client has its bytes; give it a beat.
     await new Promise((r) => setTimeout(r, 250));
     await proxy.close();
-    const result = lintExchanges(exchanges, opts);
+    const result = lintTurns(turns, opts, incomplete);
     const title = sessionPath ?? "not recorded";
     if (p.values.json) process.stdout.write(JSON.stringify(toJson(result, title), null, 2) + "\n");
     else process.stdout.write("\n" + renderReport(result, title, !!p.values.sections));
@@ -277,11 +335,29 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
     );
     const code = await new Promise<number>((resolveCode) => {
       const child = spawn(cmd, args, { stdio: "inherit", env: { ...process.env, ...proxy.env } });
+      // SIGTERM and SIGHUP from CI, a supervisor or a closed terminal are sent to
+      // tokenwire alone: pass them on. Ctrl-C is different: the terminal already sends
+      // SIGINT to the whole process group, the command included, so forwarding it would
+      // deliver it twice (and a second Ctrl-C means "force quit" to many tools). On
+      // SIGINT tokenwire only stays alive, to report once the command has finished.
+      const forward = (signal: NodeJS.Signals) => child.kill(signal);
+      const forwarded = ["SIGTERM", "SIGHUP"] as const;
+      const survive = () => {};
+      for (const s of forwarded) process.on(s, forward);
+      process.on("SIGINT", survive);
+      const done = (c: number) => {
+        for (const s of forwarded) process.off(s, forward);
+        process.off("SIGINT", survive);
+        resolveCode(c);
+      };
       child.on("error", (err) => {
         out(pc.red(`✗ could not start ${cmd}: ${err.message}\n`));
-        resolveCode(EXIT_ERROR);
+        done(EXIT_ERROR);
       });
-      child.on("exit", (c, signal) => resolveCode(c ?? (signal ? 128 : EXIT_ERROR)));
+      // Killed by a signal: the shell convention, 128 + the signal's number.
+      child.on("exit", (c, signal) =>
+        done(c ?? (signal ? 128 + (constants.signals[signal] ?? 0) : EXIT_ERROR)),
+      );
     });
     const lintCode = await finish();
     return code !== 0 ? code : lintCode;
@@ -314,7 +390,12 @@ function runOnSession(p: Parsed): number {
   if (p.values.json) process.stdout.write(JSON.stringify(toJson(result, file), null, 2) + "\n");
   else if (p.command === "report")
     process.stdout.write(renderReport(result, file, !!p.values.sections));
-  else process.stdout.write(renderFindings(result.findings) + renderSummary(result.findings));
+  else
+    process.stdout.write(
+      renderIncomplete(result.incomplete) +
+        renderFindings(result.findings) +
+        renderSummary(result.findings),
+    );
   return exitFor(result.findings, !!p.values.strict);
 }
 
@@ -334,11 +415,13 @@ function runSnapshot(p: Parsed): number {
     throw new UsageError(
       `no session file at ${file}. Record one with 'tokenwire wrap --offline -- <command>'.`,
     );
-  const turns = turnsOf(readSession(resolve(file)));
+  const snapshot = fromSession(readSession(resolve(file)));
+  const { turns } = snapshot;
   if (!turns.length) throw new UsageError(`${file} has no chat requests to snapshot`);
   const out = str(p.values.output) ?? DEFAULT_SNAPSHOT;
-  writeSnapshot(resolve(out), toSnapshot(turns));
-  const total = turns.reduce((a, t) => a + t.context.totalTokens, 0);
+  writeSnapshot(resolve(out), snapshot);
+  const total = turns.reduce((a, t) => a + t.totalTokens, 0);
+  process.stderr.write(renderIncomplete(snapshot.incomplete ?? []));
   process.stderr.write(
     `${pc.green("✓")} wrote ${out} — ${turns.length} request${turns.length === 1 ? "" : "s"}, ${fmt(total)} input tokens per run\n`,
   );

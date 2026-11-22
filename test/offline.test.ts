@@ -266,4 +266,35 @@ describe("sampleFromSchema bounds", () => {
     ).toBe(64);
     expect(sampleFromSchema({ type: "string", minLength: -5 })).toBe("");
   });
+
+  it("bounds the whole sample, not just each array: nested minItems stay small and fast", async () => {
+    const { sampleFromSchema } = await import("../src/offline.js");
+    const nest = (levels: number): Record<string, unknown> =>
+      levels === 0
+        ? { type: "string", minLength: 64 }
+        : { type: "array", minItems: 64, items: nest(levels - 1) };
+    for (const levels of [4, 5, 8]) {
+      const started = Date.now();
+      const json = JSON.stringify(sampleFromSchema(nest(levels)));
+      expect(Date.now() - started).toBeLessThan(1000);
+      expect(json.length).toBeLessThan(1024 * 1024);
+    }
+    // Wide objects multiply the same way.
+    const props = Object.fromEntries(
+      Array.from({ length: 64 }, (_, i) => [`p${i}`, { $ref: "#/$defs/node" }]),
+    );
+    const wide = {
+      $ref: "#/$defs/node",
+      $defs: { node: { type: "object", properties: props } },
+    };
+    expect(JSON.stringify(sampleFromSchema(wide)).length).toBeLessThan(1024 * 1024);
+    // A large value copied from the schema is charged by size, not as one value.
+    const big = { type: "array", minItems: 64, items: { const: "y".repeat(100_000) } };
+    expect(JSON.stringify(sampleFromSchema(big)).length).toBeLessThan(1024 * 1024);
+    // A schema well inside the budget is still sampled in full.
+    const fine = nest(2);
+    const small = sampleFromSchema(fine) as string[][];
+    expect(small).toHaveLength(64);
+    expect(small.every((row) => row.length === 64 && row.every((x) => x.length === 64))).toBe(true);
+  });
 });

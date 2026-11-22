@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -239,5 +241,225 @@ describe("the record", () => {
     );
     expect(x.request.headers["x-api-key"]).toBe("[stripped]");
     expect(x.durationMs).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("what reaches the request handler", () => {
+  it("answers 404 for an upstream named after an Object.prototype key, and keeps serving", async () => {
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      const res = await fetch(`${proxy.url}/${name}/x`);
+      expect(res.status).toBe(404);
+      expect(await res.text()).toContain(`no upstream named "${name}"`);
+    }
+    const after = await fetch(`${proxy.url}/anthropic/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    });
+    expect(after.status).toBe(200);
+  });
+
+  it("answers 400 for a request target it cannot parse, and keeps serving", async () => {
+    const { port } = new URL(proxy.url);
+    const reply = await new Promise<string>((resolve, reject) => {
+      const socket = net.connect(Number(port), "127.0.0.1", () =>
+        socket.write("GET http://[ HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"),
+      );
+      let data = "";
+      socket.on("data", (d) => (data += String(d)));
+      socket.on("end", () => resolve(data));
+      socket.on("error", reject);
+    });
+    expect(reply).toMatch(/^HTTP\/1\.1 400/);
+    expect((await fetch(`${proxy.url}/nope/x`)).status).toBe(404);
+  });
+});
+
+describe("when one side goes away", () => {
+  /** An upstream that misbehaves on purpose, and says what happened to the requests it got. */
+  let faulty: http.Server;
+  let faultyUrl: string;
+  let p: RunningProxy;
+  const recorded: Exchange[] = [];
+  let upstreamSawClose: () => void = () => {};
+  const upstreamClosed = () =>
+    new Promise<void>((resolve) => {
+      upstreamSawClose = resolve;
+    });
+
+  beforeAll(async () => {
+    faulty = http.createServer((req, res) => {
+      req.resume();
+      if (req.url === "/reset") {
+        // Headers and one SSE event, then the connection dies mid-stream.
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('event: message_start\ndata: {"type":"message_start"}\n\n');
+        setTimeout(() => res.socket?.destroy(), 20);
+        return;
+      }
+      if (req.url === "/hang") {
+        // Never answers; reports when the proxy gives up on it.
+        req.socket.on("close", () => upstreamSawClose());
+        return;
+      }
+      if (req.url === "/hang-mid-stream") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('event: ping\ndata: {"type":"ping"}\n\n');
+        req.socket.on("close", () => upstreamSawClose());
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((r) => faulty.listen(0, "127.0.0.1", () => r()));
+    faultyUrl = `http://127.0.0.1:${(faulty.address() as net.AddressInfo).port}`;
+    p = await startProxy({ upstreams: { faulty: faultyUrl }, onExchange: (x) => recorded.push(x) });
+  });
+  afterAll(async () => {
+    await p.close();
+    faulty.closeAllConnections();
+    await new Promise((r) => faulty.close(r));
+  });
+
+  const until = async (cond: () => boolean, ms = 2000) => {
+    const end = Date.now() + ms;
+    while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    return cond();
+  };
+
+  it("an upstream that dies mid-stream ends the client's response promptly, as a failure", async () => {
+    const started = Date.now();
+    const res = await fetch(`${p.url}/faulty/reset`, { signal: AbortSignal.timeout(3000) });
+    expect(res.status).toBe(200);
+    // The body must fail, not hang and not look complete.
+    await expect(res.text()).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(await until(() => recorded.some((x) => x.path === "/reset"))).toBe(true);
+    const x = recorded.find((e) => e.path === "/reset")!;
+    expect(x.error).toMatch(/failed mid-response/);
+    expect(x.response.status).toBe(200);
+    // The proxy is still up.
+    expect((await fetch(`${p.url}/nope/x`)).status).toBe(404);
+  });
+
+  it("a client that gives up before the response destroys the upstream request", async () => {
+    const closed = upstreamClosed();
+    const ac = new AbortController();
+    const pending = fetch(`${p.url}/faulty/hang`, {
+      method: "POST",
+      body: "{}",
+      signal: ac.signal,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    ac.abort();
+    await expect(pending).rejects.toThrow();
+    await expect(
+      Promise.race([
+        closed,
+        new Promise((_, no) => setTimeout(() => no(new Error("leaked")), 1500)),
+      ]),
+    ).resolves.toBeUndefined();
+    expect(await until(() => recorded.some((x) => x.path === "/hang"))).toBe(true);
+    const hung = recorded.find((x) => x.path === "/hang")!;
+    expect(hung.error).toMatch(/client closed/);
+    // No response was ever sent, so none is recorded: not a 502 that never happened.
+    expect(hung.response.status).toBe(0);
+  });
+
+  it("a client that gives up mid-stream destroys the upstream request", async () => {
+    const closed = upstreamClosed();
+    const ac = new AbortController();
+    const res = await fetch(`${p.url}/faulty/hang-mid-stream`, { signal: ac.signal });
+    const reader = res.body!.getReader();
+    await reader.read();
+    ac.abort();
+    await expect(
+      Promise.race([
+        closed,
+        new Promise((_, no) => setTimeout(() => no(new Error("leaked")), 1500)),
+      ]),
+    ).resolves.toBeUndefined();
+    expect(await until(() => recorded.some((x) => x.path === "/hang-mid-stream"))).toBe(true);
+    const x = recorded.find((e) => e.path === "/hang-mid-stream")!;
+    expect(x.error).toMatch(/client closed/);
+    expect(x.response.status).toBe(200);
+  });
+});
+
+describe("an upstream URL with a path or a query", () => {
+  const via = async (base: string, clientPath: string) => {
+    const p = await startProxy({ upstreams: { gw: base } });
+    try {
+      // The fake upstream answers 404 for paths it does not serve; what matters is what it received.
+      await (await fetch(`${p.url}/gw${clientPath}`, { method: "POST", body: "{}" })).arrayBuffer();
+      return upstream.received.at(-1)!.path;
+    } finally {
+      await p.close();
+    }
+  };
+
+  it("keeps the upstream's path as a prefix, without doubling slashes", async () => {
+    expect(await via(`${upstream.url}/openai`, "/v1/chat/completions")).toBe(
+      "/openai/v1/chat/completions",
+    );
+    expect(await via(`${upstream.url}/openai/`, "/v1/chat/completions")).toBe(
+      "/openai/v1/chat/completions",
+    );
+    expect(await via(`${upstream.url}/`, "/v1/messages")).toBe("/v1/messages");
+  });
+
+  it("merges the upstream's query with the client's; the client's is passed on as sent and wins", async () => {
+    expect(await via(`${upstream.url}/openai?api-version=preview`, "/v1/responses")).toBe(
+      "/openai/v1/responses?api-version=preview",
+    );
+    expect(
+      await via(
+        `${upstream.url}/openai?api-version=preview&keep=1`,
+        "/v1/responses?api-version=2025&a=%20b",
+      ),
+    ).toBe("/openai/v1/responses?keep=1&api-version=2025&a=%20b");
+    expect(await via(upstream.url, "/v1/messages?beta=true&x=%2F")).toBe(
+      "/v1/messages?beta=true&x=%2F",
+    );
+  });
+
+  it("refuses an upstream that is not an http(s) URL, before listening", async () => {
+    await expect(startProxy({ upstreams: { bad: "not a url" } })).rejects.toThrow(
+      'upstream "bad" must be an http:// or https:// URL',
+    );
+    await expect(startProxy({ upstreams: { bad: "file:///etc/passwd" } })).rejects.toThrow(
+      /http:\/\/ or https:\/\//,
+    );
+  });
+});
+
+describe("bodies over the record limit", () => {
+  it("marks a truncated request instead of recording a fragment", async () => {
+    const got: Exchange[] = [];
+    const small = await startProxy({
+      upstreams: { anthropic: upstream.url },
+      maxRecordBytes: 1024,
+      onExchange: (x) => got.push(x),
+    });
+    try {
+      const body = JSON.stringify({
+        model: "m",
+        messages: [{ role: "user", content: "x".repeat(4096) }],
+      });
+      const res = await fetch(`${small.url}/anthropic/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(res.status).toBe(200);
+      // The wire carried all of it.
+      expect(sha(upstream.received.at(-1)!.body)).toBe(sha(body));
+      for (let i = 0; i < 50 && !got.length; i++) await new Promise((r) => setTimeout(r, 10));
+      const x = got[0]!;
+      expect(x.request.truncated).toBe(true);
+      expect(x.request.bytes).toBe(Buffer.byteLength(body));
+      expect(x.request.body).toBe(`[truncated: ${Buffer.byteLength(body)} bytes]`);
+    } finally {
+      await small.close();
+    }
   });
 });

@@ -1,10 +1,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { SectionKind } from "./context.js";
 import { findCacheBreaks, prefixLength, type CacheBreak } from "./diff.js";
-import { turnsOf } from "./lint.js";
+import { incompleteOf, turnsOf } from "./lint.js";
+import { createHash } from "node:crypto";
+import { redact, redactSecrets } from "./rules/patterns.js";
 import type { Turn } from "./rules/index.js";
 import { readSession } from "./session.js";
-import type { ApiKind } from "./types.js";
+import type { ApiKind, Exchange } from "./types.js";
 import { VERSION } from "./version.js";
 
 export const DEFAULT_SNAPSHOT = "tokenwire.snapshot.json";
@@ -24,11 +26,19 @@ export interface SnapshotSection {
    * The text. In a committed snapshot, only for the static prefix — the system prompt
    * and tool definitions at the start of the request, which live in your code.
    * Conversation text (what users typed, what tools returned, system messages inserted
-   * mid-conversation) is never written.
+   * mid-conversation) is never written. Anything `secret-in-context` would flag is
+   * replaced with `[redacted: …]`; `tokens` and `hash` are of the text as sent.
    */
   text?: string;
   cacheControl?: true;
+  /**
+   * SHA-256 of each secret redacted from `text`, in order. In memory only, never
+   * written: it lets a diff say which placeholder a change is inside.
+   */
+  secrets?: string[];
 }
+
+const sha256 = (t: string) => createHash("sha256").update(t).digest("hex");
 
 export interface SnapshotTurn {
   n: number;
@@ -52,6 +62,8 @@ export interface Snapshot {
    * snapshot keeps no conversation hashes to find them again.
    */
   cacheBreaks?: CacheBreak[];
+  /** Requests the record could not keep whole, so they are missing from `turns`. */
+  incomplete?: string[];
 }
 
 /**
@@ -70,14 +82,20 @@ export function toSnapshot(turns: Turn[], keepText: "prefix" | "all" = "prefix")
       ...(t.context.model ? { model: t.context.model } : {}),
       totalTokens: t.context.totalTokens,
       exact: t.context.exact,
-      sections: t.context.sections.map((s) => ({
-        kind: s.kind,
-        ...(s.name !== undefined ? { name: s.name } : {}),
-        tokens: s.tokens,
-        hash: s.hash,
-        text: s.text,
-        ...(s.cacheControl ? { cacheControl: true as const } : {}),
-      })),
+      sections: t.context.sections.map((s) => {
+        // Redacted on both sides of a diff alike, so a secret is never quoted and the
+        // redaction itself never reads as a change.
+        const r = redact(s.text);
+        return {
+          kind: s.kind,
+          ...(s.name !== undefined ? { name: s.name } : {}),
+          tokens: s.tokens,
+          hash: s.hash,
+          text: r.text,
+          ...(s.cacheControl ? { cacheControl: true as const } : {}),
+          ...(r.secrets.length ? { secrets: r.secrets.map(sha256) } : {}),
+        };
+      }),
     })),
   };
   if (keepText === "all") return full;
@@ -89,7 +107,11 @@ export function toSnapshot(turns: Turn[], keepText: "prefix" | "all" = "prefix")
       return {
         ...t,
         sections: t.sections.map((s, i) => {
-          if (i < prefix) return s;
+          if (i < prefix) {
+            const kept = { ...s };
+            delete kept.secrets;
+            return kept;
+          }
           // Conversation sections: kind, name and size only.
           return {
             kind: s.kind,
@@ -134,12 +156,56 @@ export function loadSnapshot(path: string, keepText: "prefix" | "all" = "prefix"
         throw new Error(
           `${path} is snapshot format ${JSON.stringify(format)}; this tokenwire (${VERSION}) reads format ${SNAPSHOT_FORMAT}. Upgrade tokenwire, or re-record the snapshot.`,
         );
-      return parsed as Snapshot;
+      return redactLoaded(parsed as Snapshot);
     }
   }
-  return toSnapshot(turnsOf(readSession(path)), keepText);
+  return fromSession(readSession(path), keepText);
+}
+
+/**
+ * A committed snapshot may predate redaction: redact its text as it is read. If any
+ * text held a secret, its cache-break quotes may hold a piece of one too, too short
+ * for a pattern to recognise, so they are dropped; the location is kept.
+ */
+function redactLoaded(snapshot: Snapshot): Snapshot {
+  let found = false;
+  const turns = snapshot.turns.map((t) => ({
+    ...t,
+    sections: t.sections.map((s) => {
+      if (s.text === undefined) return s;
+      const text = redactSecrets(s.text);
+      if (text !== s.text) found = true;
+      return { ...s, text };
+    }),
+  }));
+  const cacheBreaks = snapshot.cacheBreaks?.map((b) => {
+    if (found) {
+      const rest = { ...b };
+      delete rest.was;
+      delete rest.now;
+      return rest;
+    }
+    return {
+      ...b,
+      ...(b.was !== undefined ? { was: redactSecrets(b.was) } : {}),
+      ...(b.now !== undefined ? { now: redactSecrets(b.now) } : {}),
+    };
+  });
+  return { ...snapshot, turns, ...(cacheBreaks ? { cacheBreaks } : {}) };
+}
+
+/** A snapshot of a recorded session, noting any request too large to record whole. */
+export function fromSession(
+  exchanges: Exchange[],
+  keepText: "prefix" | "all" = "prefix",
+): Snapshot {
+  const snapshot = toSnapshot(turnsOf(exchanges), keepText);
+  const incomplete = exchanges.flatMap((x, i) => incompleteOf(x, i + 1));
+  return incomplete.length ? { ...snapshot, incomplete } : snapshot;
 }
 
 export function writeSnapshot(path: string, snapshot: Snapshot): void {
-  writeFileSync(path, JSON.stringify(snapshot, null, 2) + "\n");
+  // `secrets` fingerprints are for in-memory comparison only.
+  const replacer = (key: string, value: unknown) => (key === "secrets" ? undefined : value);
+  writeFileSync(path, JSON.stringify(snapshot, replacer, 2) + "\n");
 }

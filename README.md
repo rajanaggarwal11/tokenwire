@@ -1,8 +1,8 @@
 # tokenwire
 
-[![CI](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml) [![CodeQL](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+**See exactly what your app sends the model, and lint it.** A local proxy for Anthropic and OpenAI traffic that flags unused tools, prompt-cache breaks down to the character, secrets, and injection in tool results. Never modifies a request.
 
-**What are you actually sending the model?** Every LLM app has a context window, and almost nobody can see it: the framework assembles it, the SDK sends it, the bill arrives. `tokenwire` is a local proxy that reads every request your app makes to Anthropic or OpenAI and lints it — wasted tokens, the same block sent twice, tool definitions nobody calls, prompt-cache misses and the exact character that caused them, secrets in the prompt, injection arriving through tool results, and how fast the context is growing.
+[![CI](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/ci.yml) [![CodeQL](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml/badge.svg)](https://github.com/rajanaggarwal11/tokenwire/actions/workflows/codeql.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 ```bash
 npx tokenwire wrap -- claude -p "summarise this repo"    # any command that honours ANTHROPIC_BASE_URL / OPENAI_BASE_URL
@@ -10,7 +10,7 @@ npx tokenwire wrap -- node agent.js
 npx tokenwire                                            # a proxy that reports live; point your app at it
 ```
 
-**It never modifies a request or a response, and the record never contains a credential.** Not a dashboard — a linter.
+The record never contains a credential, and stays on your machine.
 
 Here is Claude Code doing a small task (read three files, grep, `git log`), through the proxy:
 
@@ -55,7 +55,7 @@ Every turn after the warm-up is 56–73% tool definitions — 29 of them, 27 of 
 | `unused-tools`             | warn     | Tools defined on 3+ turns that the model never called, and what their definitions cost on every turn.                                                                                                                                                                                                     |
 | `no-cache`                 | warn     | Anthropic: a 4,096+-token prefix sent byte-identical across turns with no `cache_control` — and what that cost.                                                                                                                                                                                           |
 | `cache-miss`               | warn     | Anthropic: `cache_control` is on and `cache_read_input_tokens` is 0 — names the section and the first character where the prefix changed (`Current time: 14:02` → `14:03`).                                                                                                                               |
-| `oversized-system`         | info     | The system prompt is 60%+ of the request.                                                                                                                                                                                                                                                                 |
+| `oversized-system`         | info     | On the latest request, the system prompt is 60%+ of the input and 2,000+ tokens.                                                                                                                                                                                                                          |
 
 `tokenwire --list-rules` prints the same. Money rules are warnings; security rules are errors; `--strict` makes warnings fail the build.
 
@@ -123,9 +123,9 @@ That is a real run: a support agent built on the Anthropic SDK, and a change tha
 npx tokenwire wrap --offline -- node test/agent-scenario.js
 ```
 
-The answer is shaped to what the request demands, so the SDK's own parsing succeeds: a forced tool (`tool_choice` naming one, `any` or `required`) gets a call with arguments built from the tool's schema; structured output (`output_config`, `response_format`, `text.format` with a JSON schema) gets JSON built from that schema. Anything else gets an empty assistant turn — `--reply "…"` sets its text — so an agent loop stops after its first request: the system prompt, the tool definitions and the opening message, which is where most of the bill and nearly every cache break come from. To cover a multi-request loop, have the scenario make each request itself.
+A request that forces a tool call or asks for structured output gets an answer built from its schema; anything else gets an empty assistant turn (`--reply "…"` sets its text), so an agent loop stops after its first request: the system prompt, the tool definitions and the opening message, which is where most of the bill and nearly every cache break come from. Details: [docs/ci.md](./docs/ci.md#how---offline-answers).
 
-**2. Commit a baseline.** `npx tokenwire snapshot` writes `tokenwire.snapshot.json`: the text and a hash of the system prompt and tool definitions at the start of each request — the parts that live in your code — and, for everything after them, only each section's kind and token count. No conversation text and no conversation hash is written: not what users typed, not what tools returned, not a system message inserted mid-conversation.
+**2. Commit a baseline.** `npx tokenwire snapshot` writes `tokenwire.snapshot.json`: the text and a hash of the system prompt and tool definitions at the start of each request — the parts that live in your code — and, for everything after them, only each section's kind and token count. No conversation text and no conversation hash is written: not what users typed, not what tools returned, not a system message inserted mid-conversation. Anything `secret-in-context` would flag in the system prompt or a tool definition is written as `[redacted: …]`; token counts are of what was actually sent.
 
 **3. Diff every PR against it.**
 
@@ -138,11 +138,11 @@ npx tokenwire diff tokenwire.snapshot.json --max-increase 10% --price 3 --runs-p
 | Input tokens per run | base → this change, per section: system prompt, tool definitions, first message                                                                                                                                                                                                 |
 | Tools                | added, removed and changed, with what each costs                                                                                                                                                                                                                                |
 | Prompt caching       | where a request stops repeating the earlier request it continues — the section, the character (for your system prompt and tools; conversation text is never quoted), and the tokens that can no longer be cached; and a timestamp or id in the prompt that changes on every run |
-| Cost                 | per run, or per day and month with `--runs-per-day`                                                                                                                                                                                                                             |
+| Cost                 | only with `--price` (your USD per million input tokens): per run, or per day and month with `--runs-per-day`. Offline counts are estimates from the o200k tokenizer, which is OpenAI's, including for Claude models                                                             |
 
-A request _continues_ an earlier one when it has the same API and model, repeats that conversation, and carries the earlier request's answer after it. Only then is it expected to repeat the prefix. A sub-agent with its own system prompt, a parallel conversation, the next question after shared few-shot examples, or a Responses API call that sends only new items is not a continuation and never counts as a break; a request for another model in between does not hide one.
+How a request is matched to the one it continues, and what does not count as a cache break: [docs/ci.md](./docs/ci.md#what-counts-as-a-cache-break).
 
-It fails (exit `1`) when the change introduces a cache break at a place where the baseline had none, or grows input tokens past `--max-increase` (`10%` or `2k`). It warns when the two sides were counted differently (provider usage on one, a tokenizer estimate on the other) or use different models. Counts for images and documents are placeholders, not their real cost. `--format markdown` writes a PR comment; `--format json` a stable shape (`version: 1`). To accept a change, re-record and run `npx tokenwire snapshot` in the same PR, so the new baseline is reviewed with the code that caused it.
+It fails (exit `1`) when the change introduces a cache break at a place where the baseline had none, or grows input tokens past `--max-increase` (`10%` or `2k`). It warns when the two sides were counted differently (provider usage on one, a tokenizer estimate on the other), use different models, or either is missing a request too large to record. Counts for images and documents are placeholders, not their real cost. `--format markdown` writes a PR comment; `--format json` a stable shape (`version: 1`). To accept a change, re-record and run `npx tokenwire snapshot` in the same PR, so the new baseline is reviewed with the code that caused it.
 
 [tokenwire-action](https://github.com/rajanaggarwal11/tokenwire-action) does all three in one step and keeps a single comment on the PR up to date.
 
@@ -160,8 +160,8 @@ Exit codes are stable: `0` nothing to report · `1` findings remain (errors, or 
 ```
 tokenwire wrap [options] -- <command> [args…]   Run a command through the proxy, then report
 tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
-tokenwire report <session> [--sections]          Report on a recorded session
-tokenwire check <session>                        Lint a recorded session for CI — exit 0/1/2
+tokenwire report [session] [--sections]          Report on a recorded session (default: tokenwire.session.jsonl)
+tokenwire check [session]                        Lint a recorded session for CI — exit 0/1/2
 tokenwire snapshot [session] [-o file]           Save what a session sends, small enough to commit
 tokenwire diff <base> [head]                     Compare snapshots or sessions — exit 0/1/2
 
@@ -172,7 +172,11 @@ tokenwire diff <base> [head]                     Compare snapshots or sessions �
 --only <ids>            --ignore <ids>            --strict             --json          --sections
 ```
 
-`--upstream` adds or replaces a target: `--upstream openai=https://my-gateway.internal` keeps the `OPENAI_BASE_URL` the proxy prints and sends the traffic wherever you say.
+Any other first word is an error (exit `2`) that names the closest command, and so is a command after `--` without `wrap`.
+
+`--upstream` adds or replaces a target: `--upstream openai=https://my-gateway.internal` keeps the `OPENAI_BASE_URL` the proxy prints and sends the traffic wherever you say. A path and a query on that URL are kept: the path is put in front of the client's, and the query is merged with the client's (the client's wins on a clash). For Azure OpenAI, `--upstream "openai=https://my-resource.openai.azure.com/openai?api-version=preview"` sends `/openai/v1/chat/completions?api-version=preview`; for a gateway that serves each provider under its own path, `--upstream anthropic=http://localhost:4000/anthropic`.
+
+`wrap` passes SIGTERM and SIGHUP on to the command. Ctrl-C in a terminal already reaches the command, so tokenwire does not send it a second time; it waits for the command to exit and then reports. A command killed by a signal exits `128` + the signal number.
 
 ## As a library
 
@@ -190,6 +194,12 @@ const { findings, turns } = lintExchanges(exchanges, { budget: 40_000 });
 
 Anything that honours `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`: the official SDKs in every language, Claude Code, Codex CLI, and most frameworks built on those SDKs. A client that pins its base URL, or refuses `http://` for localhost, is out of scope.
 
+## Why not Langfuse, LiteLLM, Helicone or promptfoo?
+
+They are good at what they do, and you may want one of them as well. Langfuse and Helicone are observability platforms, hosted or self-hosted, that trace and store production LLM traffic over time. LiteLLM is a gateway: one API in front of many providers, with routing, keys and spend limits. promptfoo is an eval and red-teaming suite that scores model outputs against test cases.
+
+tokenwire is narrower. It is a local pass-through that never modifies a request, needs no account and no server, and keeps its record in a file next to your code. Its job is the request itself: what each one carries, section by section, and what in it is waste or risk. In CI it diffs what each PR adds to every request (tokens per section, tools added or changed, the exact character that breaks the prompt cache) offline, with no API key.
+
 ## Design notes
 
 **Why a proxy and not an SDK plugin.** There is one SDK plugin per language per framework, and none for the tool you did not write. There is one wire.
@@ -198,7 +208,9 @@ Anything that honours `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`: the official SD
 
 **Heuristics are labelled.** `unused-tools` will flag a tool your next task needs; `growth` is a projection from a median. They exist to make a person look, with the number in hand.
 
-**What it does not do.** No PII detection (a regex is worse than nothing there), no judgement of whether the model _followed_ an instruction (that needs a model), no cost in currency (prices change; tokens do not).
+**What it does not do.** No PII detection (a regex is worse than nothing there), no judgement of whether the model _followed_ an instruction (that needs a model), and no built-in prices: everything is counted in tokens, and `diff` shows dollars only when you pass `--price` with your own rate (prices change; tokens do not).
+
+**Requests over 8 MB.** The wire is unaffected, but the record keeps at most 8 MB of each body. A larger request (usually base64 images or PDFs) is marked `truncated` in the record, left out of linting, and named in a warning by `report`, `check`, `snapshot` and `diff`.
 
 ## Requirements
 
@@ -206,7 +218,7 @@ Node 22.13 or newer.
 
 ## Working with me
 
-**Want this run on your agent?** I review what production agents send — cost, caching, the paths injection takes — and hand back the numbers with the fixes. Sponsor the project, or write to me: [aggarwal11.rajan05@gmail.com](mailto:aggarwal11.rajan05@gmail.com).
+**Want this run on your agent?** I review what production agents send — cost, caching, the paths injection takes — and hand back the numbers with the fixes. Write to me: [aggarwal11.rajan05@gmail.com](mailto:aggarwal11.rajan05@gmail.com).
 
 ## License
 

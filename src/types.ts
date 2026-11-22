@@ -26,7 +26,11 @@ export interface Exchange {
   at: string;
   upstream: string;
   method: string;
-  /** Path and query as sent to the upstream, e.g. /v1/messages?beta=true */
+  /**
+   * Path and query as the client sent them, after the upstream name, e.g.
+   * /v1/messages?beta=true. A path prefix or query on the `--upstream` URL is added
+   * on the way out and is not part of this.
+   */
   path: string;
   kind: ApiKind;
   model?: string;
@@ -36,6 +40,12 @@ export interface Exchange {
     /** Parsed JSON body, or the raw text when it was not JSON. */
     body: unknown;
     bytes: number;
+    /**
+     * The body was larger than the record keeps (8 MB by default): `body` holds a
+     * placeholder, and the request is left out of linting, with a warning. The wire
+     * was unaffected. Absent in records made before 0.2.0.
+     */
+    truncated?: boolean;
   };
   response: {
     status: number;

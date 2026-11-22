@@ -1,6 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import { randomUUID } from "node:crypto";
+import { urlToHttpOptions } from "node:url";
 import { decodeBody } from "./decode.js";
 import { apiKindOf, extract, parseSse, stripCredentials } from "./exchange.js";
 import { OFFLINE_KEY, startOfflineUpstream, type OfflineUpstream } from "./offline.js";
@@ -57,6 +58,16 @@ export interface RunningProxy {
  * sees or what the client receives.
  */
 export async function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
+  for (const [name, url] of Object.entries(options.upstreams ?? {})) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(url);
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:"))
+      throw new Error(`upstream "${name}" must be an http:// or https:// URL, got "${url}"`);
+  }
   let offline: OfflineUpstream | undefined;
   if (options.offline) offline = await startOfflineUpstream(options.offline);
   const defaults = offline
@@ -70,10 +81,18 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
 
   const server = http.createServer((req, res) => {
     const started = Date.now();
-    const url = new URL(req.url ?? "/", "http://tokenwire.invalid");
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://tokenwire.invalid");
+    } catch {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("tokenwire: could not parse the request target.\n");
+      return;
+    }
     const [name, ...rest] = url.pathname.split("/").filter(Boolean);
-    const base = name ? upstreams[name] : undefined;
-    if (!name || !base) {
+    // Own properties only: "/constructor/…" or "/__proto__/…" must not reach Object.prototype.
+    const base = name && Object.hasOwn(upstreams, name) ? upstreams[name] : undefined;
+    if (!name || typeof base !== "string") {
       res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
       res.end(
         `tokenwire: no upstream named "${name ?? ""}". Known: ${Object.keys(upstreams).join(", ")}. ` +
@@ -81,8 +100,17 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       );
       return;
     }
+    // What the client asked for, after the upstream name. This is what the record keeps.
     const path = `/${rest.join("/")}${url.search}`;
-    const target = new URL(path, base.endsWith("/") ? base : `${base}/`);
+    const upstreamBase = new URL(base);
+    const target = upstreamTarget(upstreamBase, `/${rest.join("/")}`, url.search);
+    // The client chooses the path, never the host: whatever the path holds, the request
+    // goes to the upstream the user configured, or nowhere.
+    if (target.origin !== upstreamBase.origin) {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`tokenwire: that path does not stay on upstream "${name}".\n`);
+      return;
+    }
 
     const headers: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
@@ -94,105 +122,171 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
     const client = target.protocol === "https:" ? https : http;
     const reqChunks: Buffer[] = [];
     let reqBytes = 0;
+    let upstreamRes: http.IncomingMessage | undefined;
+    const resChunks: Buffer[] = [];
+    let resBytes = 0;
+    let recorded = false;
+    let clientGone = false;
 
-    const upstreamReq = client.request(target, { method: req.method, headers }, (upstreamRes) => {
-      const resHeaders: Record<string, string | string[]> = {};
-      for (const [k, v] of Object.entries(upstreamRes.headers)) {
-        if (v === undefined || HOP_BY_HOP.has(k)) continue;
-        resHeaders[k] = v;
-      }
-      res.writeHead(upstreamRes.statusCode ?? 502, resHeaders);
-
-      const resChunks: Buffer[] = [];
-      let resBytes = 0;
-      let truncated = false;
-      upstreamRes.on("data", (chunk: Buffer) => {
-        resBytes += chunk.length;
-        if (resBytes <= maxRecord) resChunks.push(chunk);
-        else truncated = true;
-      });
-      upstreamRes.pipe(res);
-      upstreamRes.on("end", () => {
-        if (!options.onExchange) return;
-        const reqBody = decodeBody(Buffer.concat(reqChunks), req.headers["content-encoding"]);
-        const resBody = truncated
-          ? Buffer.concat(resChunks)
-          : decodeBody(Buffer.concat(resChunks), upstreamRes.headers["content-encoding"]);
-        const contentType = String(upstreamRes.headers["content-type"] ?? "");
-        const stream = contentType.includes("text/event-stream");
-        const kind = apiKindOf(path);
-        const requestJson = parseJson(reqBody.toString("utf8"));
-        const responseBody = truncated
-          ? `[truncated: ${resBytes} bytes]`
-          : stream
-            ? parseSse(resBody.toString("utf8"))
-            : parseJson(resBody.toString("utf8"));
-        const isOffline = offlineNames.has(name);
-        const extracted = truncated
-          ? { usage: extract(kind, undefined, false).usage, toolCalls: [], text: "" }
-          : extract(kind, responseBody, stream);
-        const { toolCalls, text } = extracted;
-        // The stand-in reports zero usage; that is not a measurement and must not read as one.
-        const usage = isOffline ? extract("other", undefined, false).usage : extracted.usage;
-        const model =
-          requestJson && typeof requestJson === "object" && "model" in requestJson
-            ? String((requestJson as { model: unknown }).model)
-            : undefined;
-        options.onExchange({
-          id: randomUUID(),
-          at: new Date(started).toISOString(),
-          upstream: name,
-          method: req.method ?? "GET",
-          path,
-          kind,
-          ...(model ? { model } : {}),
-          stream,
-          request: { headers: stripCredentials(req.headers), body: requestJson, bytes: reqBytes },
-          response: {
-            status: upstreamRes.statusCode ?? 0,
-            headers: stripCredentials(upstreamRes.headers),
-            body: responseBody,
-            bytes: resBytes,
-            truncated,
-            usage,
-            toolCalls,
-            text,
-          },
-          durationMs: Date.now() - started,
-          ...(isOffline ? { offline: true as const } : {}),
-        });
-      });
-    });
-
-    upstreamReq.on("error", (err) => {
-      if (!res.headersSent) res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
-      res.end(`tokenwire: upstream "${name}" (${target.origin}) is unreachable: ${err.message}\n`);
-      options.onExchange?.({
+    /**
+     * One record per exchange, however it ends: the response completed, the upstream
+     * failed (before or during the response), or the client went away.
+     */
+    const record = (error?: string) => {
+      if (recorded) return;
+      recorded = true;
+      if (!options.onExchange) return;
+      const kind = apiKindOf(path);
+      const reqTruncated = reqBytes > maxRecord;
+      const requestJson = reqTruncated
+        ? `[truncated: ${reqBytes} bytes]`
+        : parseJson(
+            decodeBody(Buffer.concat(reqChunks), req.headers["content-encoding"]).toString("utf8"),
+          );
+      const model =
+        requestJson && typeof requestJson === "object" && "model" in requestJson
+          ? String((requestJson as { model: unknown }).model)
+          : undefined;
+      const request = {
+        headers: stripCredentials(req.headers),
+        body: requestJson,
+        bytes: reqBytes,
+        ...(reqTruncated ? { truncated: true as const } : {}),
+      };
+      const base = {
         id: randomUUID(),
         at: new Date(started).toISOString(),
         upstream: name,
         method: req.method ?? "GET",
         path,
-        kind: apiKindOf(path),
-        stream: false,
-        request: {
-          headers: stripCredentials(req.headers),
-          body: parseJson(Buffer.concat(reqChunks).toString("utf8")),
-          bytes: reqBytes,
-        },
+        kind,
+        ...(model ? { model } : {}),
+      };
+      const none = extract("other", undefined, false).usage;
+
+      if (!upstreamRes) {
+        // No response at all: the upstream was unreachable, or the client left first.
+        options.onExchange({
+          ...base,
+          stream: false,
+          request,
+          response: {
+            // What the client was sent: 502 when the upstream was unreachable, 0 when
+            // the client left before any response.
+            status: res.headersSent ? res.statusCode : 0,
+            headers: {},
+            body: undefined,
+            bytes: 0,
+            truncated: false,
+            usage: none,
+            toolCalls: [],
+            text: "",
+          },
+          durationMs: Date.now() - started,
+          error: error ?? "no response",
+        });
+        return;
+      }
+
+      const truncated = resBytes > maxRecord;
+      const contentType = String(upstreamRes.headers["content-type"] ?? "");
+      const stream = contentType.includes("text/event-stream");
+      let responseBody: unknown;
+      if (truncated) responseBody = `[truncated: ${resBytes} bytes]`;
+      else {
+        let raw: Buffer;
+        try {
+          raw = decodeBody(Buffer.concat(resChunks), upstreamRes.headers["content-encoding"]);
+        } catch {
+          // A compressed body cut off mid-stream may not decode; keep what can be said.
+          raw = Buffer.alloc(0);
+        }
+        responseBody = stream ? parseSse(raw.toString("utf8")) : parseJson(raw.toString("utf8"));
+      }
+      const isOffline = offlineNames.has(name);
+      const extracted = truncated
+        ? { usage: none, toolCalls: [], text: "" }
+        : extract(kind, responseBody, stream);
+      const { toolCalls, text } = extracted;
+      // The stand-in reports zero usage; that is not a measurement and must not read as one.
+      const usage = isOffline ? none : extracted.usage;
+      options.onExchange({
+        ...base,
+        stream,
+        request,
         response: {
-          status: 502,
-          headers: {},
-          body: undefined,
-          bytes: 0,
-          truncated: false,
-          usage: extract("other", undefined, false).usage,
-          toolCalls: [],
-          text: "",
+          status: upstreamRes.statusCode ?? 0,
+          headers: stripCredentials(upstreamRes.headers),
+          body: responseBody,
+          bytes: resBytes,
+          truncated,
+          usage,
+          toolCalls,
+          text,
         },
         durationMs: Date.now() - started,
-        error: err.message,
+        ...(error ? { error } : {}),
+        ...(isOffline ? { offline: true as const } : {}),
       });
+    };
+
+    const upstreamReq = client.request(
+      {
+        // Scheme, host, port and any credentials from the configured upstream; only the
+        // path from the client.
+        ...urlToHttpOptions(upstreamBase),
+        path: `${target.pathname}${target.search}`,
+        method: req.method,
+        headers,
+      },
+      (r) => {
+        upstreamRes = r;
+        const resHeaders: Record<string, string | string[]> = {};
+        for (const [k, v] of Object.entries(r.headers)) {
+          if (v === undefined || HOP_BY_HOP.has(k)) continue;
+          resHeaders[k] = v;
+        }
+        res.writeHead(r.statusCode ?? 502, resHeaders);
+        r.on("data", (chunk: Buffer) => {
+          resBytes += chunk.length;
+          if (resBytes <= maxRecord) resChunks.push(chunk);
+        });
+        r.pipe(res);
+        r.on("end", () => record());
+        // The upstream went away mid-response. The client must not be left waiting for
+        // bytes that will never come, and must not receive a response that looks whole:
+        // the connection is cut, as the upstream's was.
+        r.on("error", (err) => {
+          res.destroy();
+          record(`upstream "${name}" failed mid-response: ${err.message}`);
+        });
+      },
+    );
+
+    upstreamReq.on("error", (err) => {
+      if (clientGone) {
+        record("the client closed the connection before the response finished");
+        return;
+      }
+      if (upstreamRes) {
+        // Headers (and maybe some of the body) are already with the client.
+        res.destroy();
+        record(`upstream "${name}" failed mid-response: ${err.message}`);
+        return;
+      }
+      res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`tokenwire: upstream "${name}" (${target.origin}) is unreachable: ${err.message}\n`);
+      record(err.message);
+    });
+
+    // The client went away before it had the whole response: stop the upstream request
+    // too, so it neither keeps generating (and billing) nor holds a socket open.
+    res.on("close", () => {
+      if (res.writableFinished) return;
+      clientGone = true;
+      upstreamReq.destroy();
+      upstreamRes?.destroy();
+      record("the client closed the connection before the response finished");
     });
 
     req.on("data", (chunk: Buffer) => {
@@ -242,6 +336,23 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       });
     });
   });
+}
+
+/**
+ * Where a request goes: the configured upstream's scheme, host and port, its path as a
+ * prefix (`https://x.openai.azure.com/openai` + `/v1/chat/completions`), and its query
+ * merged with the client's (`?api-version=…`). The client's query is passed on as sent
+ * and wins over an upstream parameter of the same name.
+ */
+function upstreamTarget(upstream: URL, clientPath: string, clientSearch: string): URL {
+  const prefix = upstream.pathname.replace(/\/+$/, "");
+  const client = new URLSearchParams(clientSearch);
+  const kept = new URLSearchParams(
+    [...upstream.searchParams].filter(([k]) => !client.has(k)),
+  ).toString();
+  const own = clientSearch.replace(/^\?/, "");
+  const query = [kept, own].filter(Boolean).join("&");
+  return new URL(`${prefix}${clientPath}${query ? `?${query}` : ""}`, upstream.origin);
 }
 
 function parseJson(text: string): unknown {

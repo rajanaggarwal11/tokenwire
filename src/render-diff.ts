@@ -21,14 +21,21 @@ const quote = (s: string, max = 60) => {
 export const COMMENT_MARKER = "<!-- tokenwire-diff -->";
 
 function changeLine(c: TextChange): string {
+  if (c.redacted)
+    return c.was.startsWith("[")
+      ? `changed inside ${c.was} at char ${fmt(c.at)}`
+      : `changed inside ${c.was}, the first at char ${fmt(c.at)}`;
   const what = c.volatile ? "a value that changes every run" : "changed";
   return `${what} at char ${fmt(c.at)}: "${quote(c.was)}" → "${quote(c.now)}"`;
 }
 
 function breakLine(b: CacheBreak): string {
   // Only the system prompt and tool definitions are quoted; conversation text never is.
-  const q =
-    b.inPrefix && b.was !== undefined && b.now !== undefined
+  const q = b.redacted
+    ? b.was?.startsWith("[")
+      ? `, inside ${b.was} at char ${fmt(b.at)}`
+      : `, inside ${b.was ?? "a redacted secret"}, the first at char ${fmt(b.at)}`
+    : b.inPrefix && b.was !== undefined && b.now !== undefined
       ? `, char ${fmt(b.at)}: "${quote(b.was)}" → "${quote(b.now)}"`
       : "";
   const why = b.volatile ? " (a timestamp or id rendered in on every request)" : "";
@@ -74,6 +81,12 @@ function estimateNote(d: Diff): string {
   return offline
     ? "captured offline: answered locally, not by a provider; counts are tokenizer estimates (o200k)"
     : "counts are tokenizer estimates (o200k), calibrated where the provider reported usage";
+}
+
+/** Said next to every dollar figure that rests on a tokenizer estimate. */
+function costCaveat(d: Diff): string {
+  if (d.head.exact && d.base.exact) return "";
+  return "estimated: o200k token counts, which is OpenAI's tokenizer, so Claude models will differ";
 }
 
 /** The PR comment. */
@@ -132,10 +145,11 @@ export function renderDiffMarkdown(d: Diff, title = "what this change sends the 
 
   if (d.cost) {
     const per = `at $${d.cost.pricePerMTok}/MTok input`;
+    const caveat = costCaveat(d);
     L.push(
-      d.cost.perDayUsd !== undefined
+      (d.cost.perDayUsd !== undefined
         ? `**Cost** ${usd(d.cost.perDayUsd)}/day, ${usd(d.cost.perDayUsd * 30)}/month — ${fmt(d.cost.runsPerDay!)} runs/day ${per}`
-        : `**Cost** ${usd(d.cost.perRunUsd)} per run ${per}`,
+        : `**Cost** ${usd(d.cost.perRunUsd)} per run ${per}`) + (caveat ? ` (${caveat})` : ""),
       "",
     );
   }
@@ -188,12 +202,15 @@ export function renderDiffText(d: Diff): string {
   const marks = { bad: pc.red("✗"), warn: pc.yellow("!"), good: pc.green("✓") };
   for (const line of cacheLines(d)) L.push(`${marks[line.icon]} cache: ${line.text}`);
   for (const w of d.warnings) L.push(`${pc.yellow("!")} ${w}`);
-  if (d.cost)
+  if (d.cost) {
+    const caveat = costCaveat(d);
     L.push(
-      d.cost.perDayUsd !== undefined
+      (d.cost.perDayUsd !== undefined
         ? `  cost ${usd(d.cost.perDayUsd)}/day at ${fmt(d.cost.runsPerDay!)} runs/day, $${d.cost.pricePerMTok}/MTok`
-        : `  cost ${usd(d.cost.perRunUsd)} per run at $${d.cost.pricePerMTok}/MTok`,
+        : `  cost ${usd(d.cost.perRunUsd)} per run at $${d.cost.pricePerMTok}/MTok`) +
+        (caveat ? pc.dim(` (${caveat})`) : ""),
     );
+  }
   L.push("");
   if (d.failures.length) for (const f of d.failures) L.push(`${pc.red("✗")} ${f}`);
   else L.push(pc.green("✓ within limits"));

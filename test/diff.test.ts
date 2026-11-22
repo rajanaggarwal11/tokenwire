@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { changedSpan, diffSnapshots, findCacheBreaks, volatileChange } from "../src/diff.js";
-import { turnsOf } from "../src/lint.js";
+import { lintExchanges, turnsOf } from "../src/lint.js";
 import { COMMENT_MARKER, renderDiffMarkdown, renderDiffText } from "../src/render-diff.js";
 import { appendExchange } from "../src/session.js";
 import { loadSnapshot, toSnapshot, writeSnapshot } from "../src/snapshot.js";
@@ -324,6 +324,9 @@ describe("diffSnapshots", () => {
     expect(d.cost!.perRunUsd).toBeCloseTo((d.delta.tokens / 1e6) * 3, 10);
     expect(d.cost!.perDayUsd).toBeCloseTo(d.cost!.perRunUsd * 10_000, 6);
     expect(renderDiffText(d)).toContain("/day at 10,000 runs/day");
+    // Estimated counts: every dollar figure says so.
+    expect(renderDiffText(d)).toContain("estimated: o200k token counts");
+    expect(renderDiffMarkdown(d)).toMatch(/\*\*Cost\*\*.*estimated: o200k token counts/);
   });
 
   it("warns when one side was counted by the provider and the other estimated", () => {
@@ -387,6 +390,121 @@ describe("snapshots keep no conversation content", () => {
     ).toBe(0);
   });
 
+  it("never write a secret from the system prompt or a tool definition, and keep its token count", () => {
+    const KEY = "sk-ant-api03-" + "K".repeat(40);
+    const GH = "ghp_" + "G".repeat(36);
+    const PEM =
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA" +
+      "Q".repeat(64) +
+      "\n-----END RSA PRIVATE KEY-----";
+    const system = `${SYSTEM}\nUse the key ${KEY} for billing.\n${PEM}\nThat is all.`;
+    const x = loop({ system, tools: [{ name: "deploy", description: `Deploys with ${GH}.` }] });
+    const committed = snap(x, "prefix");
+    const json = JSON.stringify(committed);
+    for (const secret of [KEY, GH, "MIIEpAIBAAKCAQEA", "QQQQQQQQ"])
+      expect(json).not.toContain(secret);
+    expect(json).toContain("[redacted: an sk- API key]");
+    expect(json).toContain("[redacted: a GitHub token]");
+    expect(json).toContain("[redacted: a private key]");
+    expect(json).toContain("That is all.");
+    // Counts are of what was sent, not of the placeholder.
+    const sent = snap(x, "all");
+    expect(committed.turns.map((t) => t.sections.map((s) => s.tokens))).toEqual(
+      sent.turns.map((t) => t.sections.map((s) => s.tokens)),
+    );
+    // Both sides redact alike: no phantom change, and a PR comment never quotes the key.
+    const d = diffSnapshots(committed, sent);
+    expect(d.system.change).toBeNull();
+    expect(d.failures).toEqual([]);
+    const edited = snap(loop({ system: system.replace("for billing", "for refunds") }));
+    const md = renderDiffMarkdown(diffSnapshots(committed, edited));
+    expect(md).toContain("refunds");
+    expect(md).not.toContain("KKKKKKKK");
+  });
+
+  it("say so when the only change is inside a redacted secret, and where", () => {
+    const A = "sk-ant-api03-" + "A".repeat(40);
+    const B = "sk-ant-api03-" + "B".repeat(40);
+    const C = "ghp_" + "C".repeat(36);
+    const D = "ghp_" + "D".repeat(36);
+    const sys = (k1: string, k2: string) => `${SYSTEM}\nbilling key ${k1}\nrepo token ${k2}\nend.`;
+    // Between runs: only the second secret changed.
+    const d = diffSnapshots(
+      snap(loop({ system: sys(A, C) }), "prefix"),
+      snap(loop({ system: sys(A, D) })),
+    );
+    expect(d.system.change).not.toBeNull();
+    expect(d.system.change!.redacted).toBe(true);
+    // A committed baseline keeps no fingerprints, so which of the two changed is not known,
+    // and the report does not guess.
+    expect(d.system.change!.was).toBe("one of the 2 redacted secrets");
+    const md = renderDiffMarkdown(d);
+    expect(md).toMatch(/changed inside one of the 2 redacted secrets, the first at char/);
+    // With one secret, it is known.
+    const one = (k: string) => `${SYSTEM}\nbilling key ${k}\nend.`;
+    const d1 = diffSnapshots(
+      snap(loop({ system: one(A) }), "prefix"),
+      snap(loop({ system: one(B) })),
+    );
+    expect(renderDiffText(d1)).toMatch(/changed inside \[redacted: an sk- API key\] at char/);
+    for (const secret of ["AAAAAAAA", "CCCCCCCC", "DDDDDDDD"]) expect(md).not.toContain(secret);
+    // Within a run: the second request re-renders the first secret. The break is located at
+    // that placeholder, not at char 0 with nothing to show.
+    const run = snap(loop({ system: sys(A, C), system2: sys(B, C) }));
+    const [brk] = findCacheBreaks(run);
+    expect(brk!.redacted).toBe(true);
+    expect(brk!.was).toBe("[redacted: an sk- API key]");
+    const redactedText = run.turns[0]!.sections[0]!.text!;
+    expect(brk!.at).toBe(redactedText.indexOf("[redacted: an sk- API key]"));
+    // The committed form keeps no secret fingerprints.
+    const path = join(tmp, "secret-change.json");
+    writeSnapshot(path, snap(loop({ system: sys(A, C) }), "prefix"));
+    expect(readFileSync(path, "utf8")).not.toContain('"secrets"');
+  });
+
+  it("redact a baseline committed before redaction existed, quotes included", () => {
+    const KEY = "sk-ant-api03-" + "Z".repeat(40);
+    const old = {
+      tokenwire: 1,
+      version: "0.1.1",
+      offline: true,
+      turns: [
+        {
+          n: 1,
+          kind: "anthropic-messages",
+          model: "claude-sonnet-5",
+          totalTokens: 100,
+          exact: false,
+          sections: [
+            { kind: "system", tokens: 100, hash: "h1", text: `You use ${KEY} for billing.` },
+          ],
+        },
+      ],
+      cacheBreaks: [
+        {
+          turn: 2,
+          previous: 1,
+          where: "the system prompt",
+          key: "the system prompt",
+          inPrefix: true,
+          at: 30,
+          was: "ZZZZZZZZZZ",
+          now: "YYYYYYYYYY",
+          volatile: false,
+          tokens: 100,
+        },
+      ],
+    };
+    const path = join(tmp, "pre-redaction.json");
+    writeFileSync(path, JSON.stringify(old));
+    const loaded = loadSnapshot(path);
+    const json = JSON.stringify(loaded);
+    expect(json).not.toContain("ZZZZZZZZZZ");
+    expect(json).toContain("[redacted: an sk- API key]");
+    expect(loaded.cacheBreaks![0]!.was).toBeUndefined();
+    expect(loaded.cacheBreaks![0]!.at).toBe(30);
+  });
+
   it("say clearly when a snapshot is from a newer format or has merge conflicts", () => {
     const future = join(tmp, "future.json");
     writeFileSync(future, JSON.stringify({ tokenwire: 2, turns: [] }));
@@ -407,5 +525,40 @@ describe("the PR comment", () => {
     const md = renderDiffMarkdown(diffSnapshots(snap(loop(), "prefix"), snap(loop())));
     expect(md.startsWith(COMMENT_MARKER)).toBe(true);
     expect(md).toContain("| **Input tokens per run** |");
+  });
+});
+
+describe("a request too large to record", () => {
+  const truncated = (): Exchange => {
+    const x = anthropicExchange({ messages: [user("big")] }, 2);
+    return {
+      ...x,
+      request: {
+        ...x.request,
+        body: "[truncated: 9437184 bytes]",
+        bytes: 9437184,
+        truncated: true,
+      },
+    };
+  };
+
+  it("is reported as a gap by lint, not silently dropped", () => {
+    const r = lintExchanges([...loop(), truncated()]);
+    expect(r.turns).toHaveLength(2);
+    expect(r.incomplete).toHaveLength(1);
+    expect(r.incomplete[0]).toMatch(
+      /#3 POST anthropic\/v1\/messages: the request body was 9\.0 MB/,
+    );
+    expect(r.incomplete[0]).toContain("not linted or counted");
+  });
+
+  it("is carried into a snapshot, and the diff warns about it", () => {
+    const path = join(tmp, "truncated.jsonl");
+    for (const e of renumber([...loop(), truncated()])) appendExchange(path, e);
+    const head = loadSnapshot(path, "all");
+    expect(head.incomplete).toHaveLength(1);
+    const d = diffSnapshots(snap(loop(), "prefix"), head);
+    expect(d.warnings.some((w) => w.startsWith("this run is missing a request: #3"))).toBe(true);
+    expect(renderDiffText(d)).toContain("this run is missing a request");
   });
 });

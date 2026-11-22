@@ -116,6 +116,13 @@ export function renderFindings(findings: Finding[]): string {
   return out.join("\n");
 }
 
+/** Exchanges the record could not keep whole. Printed before findings so a gap is not mistaken for a clean run. */
+export function renderIncomplete(incomplete: string[]): string {
+  return (
+    incomplete.map((m) => `${pc.yellow("!")} ${m}\n`).join("") + (incomplete.length ? "\n" : "")
+  );
+}
+
 export function renderSummary(findings: Finding[]): string {
   const s = summarize(findings);
   if (!s.total) return "";
@@ -144,7 +151,7 @@ ${tools}`
 ${renderSections(result.turns)}`
       : ""
   }
-${renderFindings(result.findings)}${renderSummary(result.findings)}`;
+${renderIncomplete(result.incomplete)}${renderFindings(result.findings)}${renderSummary(result.findings)}`;
 }
 
 export function toJson(result: LintResult, session: string) {
@@ -168,5 +175,6 @@ export function toJson(result: LintResult, session: string) {
     rulesRun: result.rulesRun,
     summary: summarize(result.findings),
     findings: result.findings,
+    incomplete: result.incomplete,
   };
 }
