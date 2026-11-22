@@ -267,7 +267,6 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
   const sessionPath = p.values["no-record"]
     ? undefined
     : resolve(str(p.values.session) ?? DEFAULT_SESSION);
-  if (sessionPath && !p.values.append) writeFileSync(sessionPath, "");
   const exchanges: Exchange[] = [];
   // Built once per exchange as it arrives; re-parsing the whole session on every request
   // made live mode quadratic.
@@ -302,6 +301,8 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
       if (fresh.length) out(renderFindings(fresh));
     },
   });
+  // Only now that the proxy is up: a bad option must not cost the user their last session.
+  if (sessionPath && !p.values.append) writeFileSync(sessionPath, "");
 
   const finish = async (): Promise<number> => {
     // The last exchange is recorded after the client has its bytes; give it a beat.

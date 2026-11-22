@@ -58,6 +58,16 @@ export interface RunningProxy {
  * sees or what the client receives.
  */
 export async function startProxy(options: ProxyOptions = {}): Promise<RunningProxy> {
+  for (const [name, url] of Object.entries(options.upstreams ?? {})) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(url);
+    } catch {
+      parsed = undefined;
+    }
+    if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:"))
+      throw new Error(`upstream "${name}" must be an http:// or https:// URL, got "${url}"`);
+  }
   let offline: OfflineUpstream | undefined;
   if (options.offline) offline = await startOfflineUpstream(options.offline);
   const defaults = offline
@@ -90,9 +100,10 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       );
       return;
     }
+    // What the client asked for, after the upstream name. This is what the record keeps.
     const path = `/${rest.join("/")}${url.search}`;
-    const upstreamBase = new URL(base.endsWith("/") ? base : `${base}/`);
-    const target = new URL(path, upstreamBase);
+    const upstreamBase = new URL(base);
+    const target = upstreamTarget(upstreamBase, `/${rest.join("/")}`, url.search);
     // The client chooses the path, never the host: whatever the path holds, the request
     // goes to the upstream the user configured, or nowhere.
     if (target.origin !== upstreamBase.origin) {
@@ -160,7 +171,9 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
           stream: false,
           request,
           response: {
-            status: 502,
+            // What the client was sent: 502 when the upstream was unreachable, 0 when
+            // the client left before any response.
+            status: res.headersSent ? res.statusCode : 0,
             headers: {},
             body: undefined,
             bytes: 0,
@@ -323,6 +336,23 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       });
     });
   });
+}
+
+/**
+ * Where a request goes: the configured upstream's scheme, host and port, its path as a
+ * prefix (`https://x.openai.azure.com/openai` + `/v1/chat/completions`), and its query
+ * merged with the client's (`?api-version=…`). The client's query is passed on as sent
+ * and wins over an upstream parameter of the same name.
+ */
+function upstreamTarget(upstream: URL, clientPath: string, clientSearch: string): URL {
+  const prefix = upstream.pathname.replace(/\/+$/, "");
+  const client = new URLSearchParams(clientSearch);
+  const kept = new URLSearchParams(
+    [...upstream.searchParams].filter(([k]) => !client.has(k)),
+  ).toString();
+  const own = clientSearch.replace(/^\?/, "");
+  const query = [kept, own].filter(Boolean).join("&");
+  return new URL(`${prefix}${clientPath}${query ? `?${query}` : ""}`, upstream.origin);
 }
 
 function parseJson(text: string): unknown {

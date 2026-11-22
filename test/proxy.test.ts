@@ -359,7 +359,10 @@ describe("when one side goes away", () => {
       ]),
     ).resolves.toBeUndefined();
     expect(await until(() => recorded.some((x) => x.path === "/hang"))).toBe(true);
-    expect(recorded.find((x) => x.path === "/hang")!.error).toMatch(/client closed/);
+    const hung = recorded.find((x) => x.path === "/hang")!;
+    expect(hung.error).toMatch(/client closed/);
+    // No response was ever sent, so none is recorded: not a 502 that never happened.
+    expect(hung.response.status).toBe(0);
   });
 
   it("a client that gives up mid-stream destroys the upstream request", async () => {
@@ -379,6 +382,53 @@ describe("when one side goes away", () => {
     const x = recorded.find((e) => e.path === "/hang-mid-stream")!;
     expect(x.error).toMatch(/client closed/);
     expect(x.response.status).toBe(200);
+  });
+});
+
+describe("an upstream URL with a path or a query", () => {
+  const via = async (base: string, clientPath: string) => {
+    const p = await startProxy({ upstreams: { gw: base } });
+    try {
+      // The fake upstream answers 404 for paths it does not serve; what matters is what it received.
+      await (await fetch(`${p.url}/gw${clientPath}`, { method: "POST", body: "{}" })).arrayBuffer();
+      return upstream.received.at(-1)!.path;
+    } finally {
+      await p.close();
+    }
+  };
+
+  it("keeps the upstream's path as a prefix, without doubling slashes", async () => {
+    expect(await via(`${upstream.url}/openai`, "/v1/chat/completions")).toBe(
+      "/openai/v1/chat/completions",
+    );
+    expect(await via(`${upstream.url}/openai/`, "/v1/chat/completions")).toBe(
+      "/openai/v1/chat/completions",
+    );
+    expect(await via(`${upstream.url}/`, "/v1/messages")).toBe("/v1/messages");
+  });
+
+  it("merges the upstream's query with the client's; the client's is passed on as sent and wins", async () => {
+    expect(await via(`${upstream.url}/openai?api-version=preview`, "/v1/responses")).toBe(
+      "/openai/v1/responses?api-version=preview",
+    );
+    expect(
+      await via(
+        `${upstream.url}/openai?api-version=preview&keep=1`,
+        "/v1/responses?api-version=2025&a=%20b",
+      ),
+    ).toBe("/openai/v1/responses?keep=1&api-version=2025&a=%20b");
+    expect(await via(upstream.url, "/v1/messages?beta=true&x=%2F")).toBe(
+      "/v1/messages?beta=true&x=%2F",
+    );
+  });
+
+  it("refuses an upstream that is not an http(s) URL, before listening", async () => {
+    await expect(startProxy({ upstreams: { bad: "not a url" } })).rejects.toThrow(
+      'upstream "bad" must be an http:// or https:// URL',
+    );
+    await expect(startProxy({ upstreams: { bad: "file:///etc/passwd" } })).rejects.toThrow(
+      /http:\/\/ or https:\/\//,
+    );
   });
 });
 
