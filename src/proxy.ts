@@ -1,6 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import { randomUUID } from "node:crypto";
+import { urlToHttpOptions } from "node:url";
 import { decodeBody } from "./decode.js";
 import { apiKindOf, extract, parseSse, stripCredentials } from "./exchange.js";
 import { OFFLINE_KEY, startOfflineUpstream, type OfflineUpstream } from "./offline.js";
@@ -90,7 +91,15 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       return;
     }
     const path = `/${rest.join("/")}${url.search}`;
-    const target = new URL(path, base.endsWith("/") ? base : `${base}/`);
+    const upstreamBase = new URL(base.endsWith("/") ? base : `${base}/`);
+    const target = new URL(path, upstreamBase);
+    // The client chooses the path, never the host: whatever the path holds, the request
+    // goes to the upstream the user configured, or nowhere.
+    if (target.origin !== upstreamBase.origin) {
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`tokenwire: that path does not stay on upstream "${name}".\n`);
+      return;
+    }
 
     const headers: Record<string, string | string[]> = {};
     for (const [k, v] of Object.entries(req.headers)) {
@@ -208,28 +217,38 @@ export async function startProxy(options: ProxyOptions = {}): Promise<RunningPro
       });
     };
 
-    const upstreamReq = client.request(target, { method: req.method, headers }, (r) => {
-      upstreamRes = r;
-      const resHeaders: Record<string, string | string[]> = {};
-      for (const [k, v] of Object.entries(r.headers)) {
-        if (v === undefined || HOP_BY_HOP.has(k)) continue;
-        resHeaders[k] = v;
-      }
-      res.writeHead(r.statusCode ?? 502, resHeaders);
-      r.on("data", (chunk: Buffer) => {
-        resBytes += chunk.length;
-        if (resBytes <= maxRecord) resChunks.push(chunk);
-      });
-      r.pipe(res);
-      r.on("end", () => record());
-      // The upstream went away mid-response. The client must not be left waiting for
-      // bytes that will never come, and must not receive a response that looks whole:
-      // the connection is cut, as the upstream's was.
-      r.on("error", (err) => {
-        res.destroy();
-        record(`upstream "${name}" failed mid-response: ${err.message}`);
-      });
-    });
+    const upstreamReq = client.request(
+      {
+        // Scheme, host, port and any credentials from the configured upstream; only the
+        // path from the client.
+        ...urlToHttpOptions(upstreamBase),
+        path: `${target.pathname}${target.search}`,
+        method: req.method,
+        headers,
+      },
+      (r) => {
+        upstreamRes = r;
+        const resHeaders: Record<string, string | string[]> = {};
+        for (const [k, v] of Object.entries(r.headers)) {
+          if (v === undefined || HOP_BY_HOP.has(k)) continue;
+          resHeaders[k] = v;
+        }
+        res.writeHead(r.statusCode ?? 502, resHeaders);
+        r.on("data", (chunk: Buffer) => {
+          resBytes += chunk.length;
+          if (resBytes <= maxRecord) resChunks.push(chunk);
+        });
+        r.pipe(res);
+        r.on("end", () => record());
+        // The upstream went away mid-response. The client must not be left waiting for
+        // bytes that will never come, and must not receive a response that looks whole:
+        // the connection is cut, as the upstream's was.
+        r.on("error", (err) => {
+          res.destroy();
+          record(`upstream "${name}" failed mid-response: ${err.message}`);
+        });
+      },
+    );
 
     upstreamReq.on("error", (err) => {
       if (clientGone) {
