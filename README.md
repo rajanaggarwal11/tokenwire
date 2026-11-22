@@ -95,9 +95,58 @@ your app ──(ANTHROPIC_BASE_URL / OPENAI_BASE_URL)──▶ tokenwire :port �
 - **Numbers.** Totals come from the provider's own `usage` and are exact. Per-section numbers are tokenizer estimates scaled so they sum to that exact total; when a response carried no usage (an OpenAI stream without `stream_options.include_usage`), the report says `≈` and never injects the option to get it.
 - **The record.** One exchange per line in `tokenwire.session.jsonl`, local, credentials replaced with `[stripped]` before the line is written. `--no-record` keeps nothing. The record does hold the content of your requests — that is what gets linted.
 
-## In CI
+## In CI: size-limit for prompts
 
-Record a scenario, then check it:
+Every PR that touches a prompt or a tool changes what each request costs, and whether the prompt cache still hits. Nobody sees it until the bill. tokenwire puts it in the PR:
+
+```
+tokenwire diff  467 → 1,151 input tokens per run  +684 (+146.5%)
+
+  system prompt                     60 →        90       +30
+  tool definitions (3 → 4)         139 →       451      +312
+  first message                     12 →        12         0
+    + search_knowledge_base +312
+
+✗ cache: request 2 stops repeating request 1 at the system prompt, char 221: "39.785" → "41.328"
+  (a timestamp or id rendered in on every request) — 553 tokens from
+  there on can't be served from cache
+  cost +$41.04/day at 20,000 runs/day, $3/MTok
+
+✗ this change breaks prompt caching at the system prompt
+```
+
+That is a real run: a support agent built on the Anthropic SDK, and a change that adds one tool and puts the current time in the system prompt.
+
+**1. Record without sending.** `--offline` answers every chat request locally, in the format the SDK expects (Anthropic Messages, OpenAI Chat Completions and Responses, streaming or not). The request your app builds is recorded exactly, and the run is free and the same every time. Any API key in the environment is replaced with a placeholder, so the SDK starts without a real one — and a request that bypasses tokenwire fails to authenticate instead of spending money. Requests reach tokenwire through `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, which the official SDKs read; an app with a hard-coded base URL, or one going through Bedrock or Vertex, is not captured.
+
+```bash
+npx tokenwire wrap --offline -- node test/agent-scenario.js
+```
+
+The answer is shaped to what the request demands, so the SDK's own parsing succeeds: a forced tool (`tool_choice` naming one, `any` or `required`) gets a call with arguments built from the tool's schema; structured output (`output_config`, `response_format`, `text.format` with a JSON schema) gets JSON built from that schema. Anything else gets an empty assistant turn — `--reply "…"` sets its text — so an agent loop stops after its first request: the system prompt, the tool definitions and the opening message, which is where most of the bill and nearly every cache break come from. To cover a multi-request loop, have the scenario make each request itself.
+
+**2. Commit a baseline.** `npx tokenwire snapshot` writes `tokenwire.snapshot.json`: the text and a hash of the system prompt and tool definitions at the start of each request — the parts that live in your code — and, for everything after them, only each section's kind and token count. No conversation text and no conversation hash is written: not what users typed, not what tools returned, not a system message inserted mid-conversation.
+
+**3. Diff every PR against it.**
+
+```bash
+npx tokenwire diff tokenwire.snapshot.json --max-increase 10% --price 3 --runs-per-day 20000
+```
+
+| It reports           |                                                                                                                                                                                                                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Input tokens per run | base → this change, per section: system prompt, tool definitions, first message                                                                                                                                                                                                 |
+| Tools                | added, removed and changed, with what each costs                                                                                                                                                                                                                                |
+| Prompt caching       | where a request stops repeating the earlier request it continues — the section, the character (for your system prompt and tools; conversation text is never quoted), and the tokens that can no longer be cached; and a timestamp or id in the prompt that changes on every run |
+| Cost                 | per run, or per day and month with `--runs-per-day`                                                                                                                                                                                                                             |
+
+A request _continues_ an earlier one when it has the same API and model, repeats that conversation, and carries the earlier request's answer after it. Only then is it expected to repeat the prefix. A sub-agent with its own system prompt, a parallel conversation, the next question after shared few-shot examples, or a Responses API call that sends only new items is not a continuation and never counts as a break; a request for another model in between does not hide one.
+
+It fails (exit `1`) when the change introduces a cache break at a place where the baseline had none, or grows input tokens past `--max-increase` (`10%` or `2k`). It warns when the two sides were counted differently (provider usage on one, a tokenizer estimate on the other) or use different models. Counts for images and documents are placeholders, not their real cost. `--format markdown` writes a PR comment; `--format json` a stable shape (`version: 1`). To accept a change, re-record and run `npx tokenwire snapshot` in the same PR, so the new baseline is reviewed with the code that caused it.
+
+[tokenwire-action](https://github.com/rajanaggarwal11/tokenwire-action) does all three in one step and keeps a single comment on the PR up to date.
+
+### Linting a recorded session
 
 ```yaml
 - run: npx tokenwire wrap --session agent.jsonl -- node test/agent-scenario.js
@@ -113,8 +162,12 @@ tokenwire wrap [options] -- <command> [args…]   Run a command through the prox
 tokenwire [options]                              Start the proxy and report live (Ctrl-C to finish)
 tokenwire report <session> [--sections]          Report on a recorded session
 tokenwire check <session>                        Lint a recorded session for CI — exit 0/1/2
+tokenwire snapshot [session] [-o file]           Save what a session sends, small enough to commit
+tokenwire diff <base> [head]                     Compare snapshots or sessions — exit 0/1/2
 
 --port <n>              --upstream <name=url>     --session <file>     --no-record     --append
+--offline               --reply <text>
+--max-increase <n|n%>   --price <usd/MTok>        --runs-per-day <n>   --format text|markdown|json
 --budget <n>            --max-growth <pct>        --window <n>
 --only <ids>            --ignore <ids>            --strict             --json          --sections
 ```

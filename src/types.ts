@@ -51,4 +51,9 @@ export interface Exchange {
   };
   durationMs: number;
   error?: string;
+  /**
+   * Captured with `--offline`: the request is exactly what the app built, but the
+   * response came from tokenwire's stand-in, not the provider. Usage is "none".
+   */
+  offline?: true;
 }
