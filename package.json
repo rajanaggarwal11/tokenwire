@@ -1,6 +1,6 @@
 {
   "name": "tokenwire",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "See exactly what your app sends the model, and lint it. A local proxy for Anthropic and OpenAI traffic that flags unused tools, prompt-cache breaks down to the character, secrets, and injection in tool results. Never modifies a request.",
   "keywords": [
     "llm",
