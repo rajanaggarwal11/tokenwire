@@ -30,6 +30,7 @@ export const OFFLINE_KEY = "tokenwire-offline-no-real-key";
 const ID = "tokenwire_offline";
 /** Upper bound on a sampled string's length or array's size, whatever the schema asks. */
 const MAX_SAMPLE = 64;
+const PAD = "x".repeat(MAX_SAMPLE);
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json =>
   v && typeof v === "object" && !Array.isArray(v) ? (v as Json) : {};
@@ -91,7 +92,8 @@ export function sampleFromSchema(schema: unknown, root: unknown = schema, depth 
       };
       const f = typeof s.format === "string" ? formats[s.format] : undefined;
       if (f) return f;
-      return "x".repeat(Math.min(MAX_SAMPLE, Math.max(0, Math.floor(Number(s.minLength) || 0))));
+      // Sliced from a fixed string: the request's schema can shorten it, never grow it.
+      return PAD.slice(0, Math.max(0, Math.floor(Number(s.minLength) || 0)));
     }
     case "integer":
     case "number": {
