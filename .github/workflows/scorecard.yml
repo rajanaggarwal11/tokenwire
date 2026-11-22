@@ -1,6 +1,7 @@
 # OpenSSF Scorecard: checks this repository's supply-chain practices (pinned actions,
-# token permissions, branch protection, …) and publishes the result to scorecard.dev
-# and to code scanning. https://github.com/ossf/scorecard-action
+# token permissions, branch protection, …) and publishes the result to scorecard.dev.
+# Results are not uploaded to code scanning: several checks (project age, solo
+# code review, fuzzing) are not actionable and would sit as open alerts. https://github.com/ossf/scorecard-action
 name: Scorecard
 
 on:
@@ -21,8 +22,6 @@ jobs:
     permissions:
       contents: read
       actions: read
-      # Upload the SARIF to code scanning.
-      security-events: write
       # publish_results: the OIDC token proves the results came from this workflow.
       id-token: write
     steps:
@@ -35,7 +34,3 @@ jobs:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
-
-      - uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
-        with:
-          sarif_file: results.sarif
