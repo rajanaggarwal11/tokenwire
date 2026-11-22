@@ -83,6 +83,20 @@ describe("usage", () => {
     expect(bad.stderr).toContain('unknown rule "no-such-rule"');
     expect((await cli("check", s, "--budget", "lots")).code).toBe(2);
   });
+  it("a command after -- without 'wrap' is an error, not a proxy that wipes the session", async () => {
+    const s = session("forgot-wrap.jsonl", [
+      anthropicExchange({ messages: [{ role: "user", content: "hi" }], usage: { input: 10 } }),
+    ]);
+    const before = readFileSync(s, "utf8");
+    const r = await cli("--session", s, "--", "node", "app.js");
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("Did you mean: tokenwire wrap --session");
+    expect(r.stderr).toContain("-- node app.js");
+    expect(r.stderr).not.toContain("proxy on");
+    expect(readFileSync(s, "utf8")).toBe(before);
+    expect((await cli("check", s, "--", "node", "app.js")).code).toBe(2);
+  });
+
   it("an unknown command is an error that names the closest one, not a proxy that wipes the session", async () => {
     const s = session("typo.jsonl", [
       anthropicExchange({ messages: [{ role: "user", content: "hi" }], usage: { input: 10 } }),
@@ -95,6 +109,9 @@ describe("usage", () => {
     expect(r.stderr).not.toContain("proxy on");
     expect(readFileSync(s, "utf8")).toBe(before);
     expect((await cli("snapshto")).stderr).toContain('Did you mean "snapshot"?');
+    // A prefix wins over a closer edit distance: "snap" is "snapshot", not "wrap".
+    expect((await cli("snap")).stderr).toContain('Did you mean "snapshot"?');
+    expect((await cli("rep")).stderr).toContain('Did you mean "report"?');
     const far = await cli("deploy");
     expect(far.code).toBe(2);
     expect(far.stderr).toContain('unknown command "deploy"');

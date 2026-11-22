@@ -95,4 +95,28 @@ describe.skipIf(!existsSync(dist))("signals, through the built binary", () => {
     expect(r.code).toBe(143);
     await until(() => !alive(childPid), 3000);
   }, 20_000);
+
+  it("wrap does not pass SIGINT on (the terminal already sent it to the command), survives it, and forwards SIGHUP", async () => {
+    const pidFile = join(tmp, "child2.pid");
+    const sigFile = join(tmp, "child2.sigint");
+    const script = `const fs = require("fs");
+      process.on("SIGINT", () => fs.appendFileSync(${JSON.stringify(sigFile)}, "SIGINT\\n"));
+      fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+      setInterval(() => {}, 1000);`;
+    const run = start(["wrap", "--no-record", "--", process.execPath, "-e", script], tmp);
+    running = run.child;
+    await until(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").length > 0);
+    const childPid = Number(readFileSync(pidFile, "utf8"));
+    grandchild = childPid;
+    // A SIGINT to tokenwire alone, as a terminal's Ctrl-C reaches it alongside the command.
+    run.child.kill("SIGINT");
+    await new Promise((r) => setTimeout(r, 300));
+    expect(existsSync(sigFile)).toBe(false);
+    expect(run.child.exitCode).toBeNull();
+    expect(alive(childPid)).toBe(true);
+    run.child.kill("SIGHUP");
+    const r = await run.exited;
+    expect(r.code).toBe(129);
+    await until(() => !alive(childPid), 3000);
+  }, 20_000);
 });

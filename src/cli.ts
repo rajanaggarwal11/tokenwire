@@ -101,9 +101,13 @@ function distance(a: string, b: string): number {
 }
 
 function closest(word: string, options: readonly string[]): string | undefined {
+  const w = word.toLowerCase();
+  // A prefix says more than an edit distance: "snap" is short for "snapshot", not a typo of "wrap".
+  const prefixed = options.filter((o) => o.startsWith(w) || w.startsWith(o));
+  if (prefixed.length === 1) return prefixed[0];
   let best: { option: string; d: number } | undefined;
   for (const option of options) {
-    const d = distance(word.toLowerCase(), option);
+    const d = distance(w, option);
     if (!best || d < best.d) best = { option, d };
   }
   return best && best.d <= Math.max(1, Math.floor(best.option.length / 2))
@@ -164,6 +168,12 @@ function parse(argv: string[]): Parsed {
     );
   }
   const command = (first as (typeof COMMANDS)[number] | undefined) ?? "proxy";
+  // "tokenwire -- node app.js" forgot the command: without this it starts a proxy that
+  // never exits, and empties the session file.
+  if (child.length && command !== "wrap")
+    throw new UsageError(
+      `only 'wrap' runs a command. Did you mean: tokenwire wrap ${own.join(" ")}${own.length ? " " : ""}-- ${child.join(" ")}`,
+    );
   return {
     command,
     positionals: command === "proxy" ? positionals : positionals.slice(1),
@@ -324,13 +334,19 @@ async function runProxy(p: Parsed, wrap: boolean): Promise<number> {
     );
     const code = await new Promise<number>((resolveCode) => {
       const child = spawn(cmd, args, { stdio: "inherit", env: { ...process.env, ...proxy.env } });
-      // A SIGTERM from CI or a supervisor, or a SIGINT sent to tokenwire alone, is meant
-      // for the command. Pass it on, and keep running long enough to report.
+      // SIGTERM and SIGHUP from CI, a supervisor or a closed terminal are sent to
+      // tokenwire alone: pass them on. Ctrl-C is different: the terminal already sends
+      // SIGINT to the whole process group, the command included, so forwarding it would
+      // deliver it twice (and a second Ctrl-C means "force quit" to many tools). On
+      // SIGINT tokenwire only stays alive, to report once the command has finished.
       const forward = (signal: NodeJS.Signals) => child.kill(signal);
-      const signals = ["SIGINT", "SIGTERM"] as const;
-      for (const s of signals) process.on(s, forward);
+      const forwarded = ["SIGTERM", "SIGHUP"] as const;
+      const survive = () => {};
+      for (const s of forwarded) process.on(s, forward);
+      process.on("SIGINT", survive);
       const done = (c: number) => {
-        for (const s of signals) process.off(s, forward);
+        for (const s of forwarded) process.off(s, forward);
+        process.off("SIGINT", survive);
         resolveCode(c);
       };
       child.on("error", (err) => {
