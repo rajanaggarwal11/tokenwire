@@ -15,7 +15,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      # Required for npm provenance (NPM_CONFIG_PROVENANCE below): the published
+      # Required for npm provenance (pnpm_config_provenance below): the published
       # package is signed with a verifiable link back to the commit and workflow
       # that built it.
       id-token: write
@@ -49,4 +49,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # pnpm 11 publishes natively and reads only pnpm_config_* from the
+          # environment; NPM_CONFIG_PROVENANCE covers an npm-based publish.
+          pnpm_config_provenance: "true"
           NPM_CONFIG_PROVENANCE: "true"

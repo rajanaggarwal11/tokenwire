@@ -172,7 +172,11 @@ tokenwire diff <base> [head]                     Compare snapshots or sessions â
 --only <ids>            --ignore <ids>            --strict             --json          --sections
 ```
 
-Any other first word is an error (exit `2`) that names the closest command. `--upstream` adds or replaces a target: `--upstream openai=https://my-gateway.internal` keeps the `OPENAI_BASE_URL` the proxy prints and sends the traffic wherever you say.
+Any other first word is an error (exit `2`) that names the closest command, and so is a command after `--` without `wrap`.
+
+`--upstream` adds or replaces a target: `--upstream openai=https://my-gateway.internal` keeps the `OPENAI_BASE_URL` the proxy prints and sends the traffic wherever you say. A path and a query on that URL are kept: the path is put in front of the client's, and the query is merged with the client's (the client's wins on a clash). For Azure OpenAI, `--upstream "openai=https://my-resource.openai.azure.com/openai?api-version=preview"` sends `/openai/v1/chat/completions?api-version=preview`; for a gateway that serves each provider under its own path, `--upstream anthropic=http://localhost:4000/anthropic`.
+
+`wrap` passes SIGTERM and SIGHUP on to the command. Ctrl-C in a terminal already reaches the command, so tokenwire does not send it a second time; it waits for the command to exit and then reports. A command killed by a signal exits `128` + the signal number.
 
 ## As a library
 
