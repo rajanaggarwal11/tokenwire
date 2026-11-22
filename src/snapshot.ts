@@ -1,10 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { SectionKind } from "./context.js";
 import { findCacheBreaks, prefixLength, type CacheBreak } from "./diff.js";
-import { turnsOf } from "./lint.js";
+import { incompleteOf, turnsOf } from "./lint.js";
+import { redactSecrets } from "./rules/patterns.js";
 import type { Turn } from "./rules/index.js";
 import { readSession } from "./session.js";
-import type { ApiKind } from "./types.js";
+import type { ApiKind, Exchange } from "./types.js";
 import { VERSION } from "./version.js";
 
 export const DEFAULT_SNAPSHOT = "tokenwire.snapshot.json";
@@ -24,7 +25,8 @@ export interface SnapshotSection {
    * The text. In a committed snapshot, only for the static prefix — the system prompt
    * and tool definitions at the start of the request, which live in your code.
    * Conversation text (what users typed, what tools returned, system messages inserted
-   * mid-conversation) is never written.
+   * mid-conversation) is never written. Anything `secret-in-context` would flag is
+   * replaced with `[redacted: …]`; `tokens` and `hash` are of the text as sent.
    */
   text?: string;
   cacheControl?: true;
@@ -52,6 +54,8 @@ export interface Snapshot {
    * snapshot keeps no conversation hashes to find them again.
    */
   cacheBreaks?: CacheBreak[];
+  /** Requests the record could not keep whole, so they are missing from `turns`. */
+  incomplete?: string[];
 }
 
 /**
@@ -75,7 +79,9 @@ export function toSnapshot(turns: Turn[], keepText: "prefix" | "all" = "prefix")
         ...(s.name !== undefined ? { name: s.name } : {}),
         tokens: s.tokens,
         hash: s.hash,
-        text: s.text,
+        // Redacted on both sides of a diff alike, so a secret is never quoted and the
+        // redaction itself never reads as a change.
+        text: redactSecrets(s.text),
         ...(s.cacheControl ? { cacheControl: true as const } : {}),
       })),
     })),
@@ -137,7 +143,17 @@ export function loadSnapshot(path: string, keepText: "prefix" | "all" = "prefix"
       return parsed as Snapshot;
     }
   }
-  return toSnapshot(turnsOf(readSession(path)), keepText);
+  return fromSession(readSession(path), keepText);
+}
+
+/** A snapshot of a recorded session, noting any request too large to record whole. */
+export function fromSession(
+  exchanges: Exchange[],
+  keepText: "prefix" | "all" = "prefix",
+): Snapshot {
+  const snapshot = toSnapshot(turnsOf(exchanges), keepText);
+  const incomplete = exchanges.flatMap((x, i) => incompleteOf(x, i + 1));
+  return incomplete.length ? { ...snapshot, incomplete } : snapshot;
 }
 
 export function writeSnapshot(path: string, snapshot: Snapshot): void {

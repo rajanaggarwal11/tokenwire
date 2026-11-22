@@ -1,3 +1,5 @@
+// The public API. Everything else under src/ is internal and may change in any release;
+// the CLI (`tokenwire snapshot`, `tokenwire diff`) is the supported way to use CI mode.
 export { VERSION } from "./version.js";
 export { startProxy, DEFAULT_UPSTREAMS } from "./proxy.js";
 export type { ProxyOptions, RunningProxy } from "./proxy.js";
@@ -8,27 +10,6 @@ export type { Context, Section, SectionKind } from "./context.js";
 export { estimateTokens } from "./tokens.js";
 export type { ApiKind, Exchange, ToolCall, Usage } from "./types.js";
 export { lintExchanges, turnsOf } from "./lint.js";
-export { startOfflineUpstream } from "./offline.js";
-export type { OfflineUpstream } from "./offline.js";
-export {
-  toSnapshot,
-  loadSnapshot,
-  writeSnapshot,
-  DEFAULT_SNAPSHOT,
-  SNAPSHOT_FORMAT,
-} from "./snapshot.js";
-export { sampleFromSchema, OFFLINE_KEY } from "./offline.js";
-export type { Snapshot, SnapshotTurn, SnapshotSection } from "./snapshot.js";
-export {
-  diffSnapshots,
-  findCacheBreak,
-  findCacheBreaks,
-  changedSpan,
-  volatileChange,
-  prefixLength,
-} from "./diff.js";
-export type { Diff, DiffOptions, CacheBreak, TextChange, ToolChange, Side } from "./diff.js";
-export { renderDiffMarkdown, renderDiffText, COMMENT_MARKER } from "./render-diff.js";
 export type { LintOptions, LintResult } from "./lint.js";
 export { ALL_RULES, RULE_IDS } from "./rules/index.js";
 export type { Finding, Rule, RuleId, RuleOptions, Severity, Turn } from "./rules/index.js";

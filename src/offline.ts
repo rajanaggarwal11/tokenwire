@@ -30,6 +30,13 @@ export const OFFLINE_KEY = "tokenwire-offline-no-real-key";
 const ID = "tokenwire_offline";
 /** Upper bound on a sampled string's length or array's size, whatever the schema asks. */
 const MAX_SAMPLE = 64;
+/**
+ * Upper bound on the values in one whole sample. Per-array caps alone multiply: four
+ * nested arrays of `minItems: 64` are 16.7 million values. Past this budget, arrays
+ * stop growing and nested values take their smallest form, so a sample stays under a
+ * megabyte, whatever the schema. A 64 × 64 grid of 64-character strings still fits.
+ */
+const MAX_NODES = 10_000;
 const PAD = "x".repeat(MAX_SAMPLE);
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json =>
@@ -38,47 +45,70 @@ const obj = (v: unknown): Json =>
 /**
  * A value that satisfies a JSON schema well enough for an SDK's parser and a typical
  * zod or pydantic model: required shapes present, enums and consts honoured, formats
- * plausible. Local `$ref`s (`#/$defs/…`, `#/definitions/…`) are followed.
+ * plausible. Local `$ref`s (`#/$defs/…`, `#/definitions/…`) are followed. The whole
+ * value is bounded (`MAX_NODES`); a schema that demands more than that gets a smaller,
+ * possibly non-conforming value rather than an unbounded one.
  */
-export function sampleFromSchema(schema: unknown, root: unknown = schema, depth = 0): unknown {
+export function sampleFromSchema(schema: unknown): unknown {
+  return sample(schema, { root: schema, left: MAX_NODES }, 0);
+}
+
+interface Budget {
+  root: unknown;
+  /** Values still allowed in this sample. */
+  left: number;
+}
+
+function sample(schema: unknown, budget: Budget, depth: number): unknown {
   const s = obj(schema);
+  // Every value costs one, including the null that ends a too-deep or circular schema.
+  budget.left--;
+  const spent = budget.left < 0;
   if (depth > 12) return null;
+  const { root } = budget;
   if (typeof s.$ref === "string" && s.$ref.startsWith("#/")) {
     let target: unknown = root;
     for (const part of s.$ref.slice(2).split("/"))
       target = obj(target)[part.replace(/~1/g, "/").replace(/~0/g, "~")];
-    return sampleFromSchema(target, root, depth + 1);
+    return sample(target, budget, depth + 1);
   }
-  if ("const" in s) return s.const;
-  if (Array.isArray(s.enum) && s.enum.length) return s.enum[0];
-  if ("default" in s) return s.default;
+  // A value copied from the schema costs what it weighs, so repeating a large one is bounded too.
+  const given = (v: unknown) => {
+    budget.left -= Math.floor((JSON.stringify(v)?.length ?? 0) / MAX_SAMPLE);
+    return v;
+  };
+  if ("const" in s) return given(s.const);
+  if (Array.isArray(s.enum) && s.enum.length) return given(s.enum[0]);
+  if ("default" in s) return given(s.default);
   for (const key of ["anyOf", "oneOf"] as const) {
     const options = s[key];
     if (Array.isArray(options) && options.length) {
       const nonNull = options.find((o) => obj(o).type !== "null") ?? options[0];
-      return sampleFromSchema(nonNull, root, depth + 1);
+      return sample(nonNull, budget, depth + 1);
     }
   }
   if (Array.isArray(s.allOf)) {
-    return Object.assign(
-      {},
-      ...s.allOf.map((part) => obj(sampleFromSchema(part, root, depth + 1))),
-    );
+    return Object.assign({}, ...s.allOf.map((part) => obj(sample(part, budget, depth + 1))));
   }
   const type = Array.isArray(s.type) ? (s.type.find((t) => t !== "null") ?? s.type[0]) : s.type;
   switch (type) {
     case "object":
     case undefined: {
-      if (type === undefined && !s.properties) return {};
+      if ((type === undefined && !s.properties) || spent) return {};
       const out: Json = {};
-      for (const [name, prop] of Object.entries(obj(s.properties)))
-        out[name] = sampleFromSchema(prop, root, depth + 1);
+      for (const [name, prop] of Object.entries(obj(s.properties))) {
+        if (budget.left <= 0) break;
+        budget.left -= Math.floor(name.length / MAX_SAMPLE);
+        out[name] = sample(prop, budget, depth + 1);
+      }
       return out;
     }
     case "array": {
       // The schema comes from the request; a sample only needs to be valid, not large.
       const n = Math.min(MAX_SAMPLE, Math.max(0, Math.floor(Number(s.minItems) || 0)));
-      return Array.from({ length: n }, () => sampleFromSchema(s.items, root, depth + 1));
+      const out: unknown[] = [];
+      while (out.length < n && budget.left > 0) out.push(sample(s.items, budget, depth + 1));
+      return out;
     }
     case "string": {
       const formats: Record<string, string> = {

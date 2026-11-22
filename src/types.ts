@@ -36,6 +36,12 @@ export interface Exchange {
     /** Parsed JSON body, or the raw text when it was not JSON. */
     body: unknown;
     bytes: number;
+    /**
+     * The body was larger than the record keeps (8 MB by default): `body` holds a
+     * placeholder, and the request is left out of linting, with a warning. The wire
+     * was unaffected. Absent in records made before 0.2.0.
+     */
+    truncated?: boolean;
   };
   response: {
     status: number;

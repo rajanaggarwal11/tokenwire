@@ -46,12 +46,21 @@ export const INVISIBLE = new RegExp(
   "u",
 );
 
-export const SECRET_PATTERNS: { pattern: RegExp; what: string }[] = [
+export const SECRET_PATTERNS: {
+  pattern: RegExp;
+  what: string;
+  /** What to remove when the secret is longer than what detecting it needs (a PEM block). */
+  extent?: RegExp;
+}[] = [
   { pattern: /\bAKIA[0-9A-Z]{16}\b/, what: "an AWS access key id" },
   { pattern: /\bsk-(?:ant-|proj-|live-)?[A-Za-z0-9_-]{20,}\b/, what: "an sk- API key" },
   { pattern: /\bgh[pousr]_[A-Za-z0-9]{30,}\b/, what: "a GitHub token" },
   { pattern: /\bxox[abp]-[A-Za-z0-9-]{10,}\b/, what: "a Slack token" },
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, what: "a private key" },
+  {
+    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+    what: "a private key",
+    extent: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/,
+  },
   { pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/, what: "a bearer token" },
   { pattern: /\bAIza[0-9A-Za-z_-]{35}\b/, what: "a Google API key" },
   {
@@ -64,4 +73,22 @@ export function excerpt(text: string, index: number, length: number): string {
   const start = Math.max(0, index - 30);
   const end = Math.min(text.length, index + length + 30);
   return `${start > 0 ? "…" : ""}${text.slice(start, end).replace(/\s+/g, " ")}${end < text.length ? "…" : ""}`;
+}
+
+/**
+ * The text with everything `secret-in-context` would flag replaced by
+ * `[redacted: <what>]`. Used wherever text leaves the local record, such as a
+ * snapshot meant to be committed.
+ */
+export function redactSecrets(text: string): string {
+  let out = text;
+  for (const { pattern, what, extent } of SECRET_PATTERNS) {
+    if (!pattern.test(out)) continue;
+    const re = extent ?? pattern;
+    out = out.replace(
+      new RegExp(re.source, `${re.flags.replace("g", "")}g`),
+      `[redacted: ${what}]`,
+    );
+  }
+  return out;
 }

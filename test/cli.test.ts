@@ -83,6 +83,23 @@ describe("usage", () => {
     expect(bad.stderr).toContain('unknown rule "no-such-rule"');
     expect((await cli("check", s, "--budget", "lots")).code).toBe(2);
   });
+  it("an unknown command is an error that names the closest one, not a proxy that wipes the session", async () => {
+    const s = session("typo.jsonl", [
+      anthropicExchange({ messages: [{ role: "user", content: "hi" }], usage: { input: 10 } }),
+    ]);
+    const before = readFileSync(s, "utf8");
+    const r = await cli("chek", s);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('unknown command "chek". Did you mean "check"?');
+    // Nothing started, nothing written.
+    expect(r.stderr).not.toContain("proxy on");
+    expect(readFileSync(s, "utf8")).toBe(before);
+    expect((await cli("snapshto")).stderr).toContain('Did you mean "snapshot"?');
+    const far = await cli("deploy");
+    expect(far.code).toBe(2);
+    expect(far.stderr).toContain('unknown command "deploy"');
+    expect(far.stderr).not.toContain("Did you mean");
+  });
 });
 
 describe("check and report on a recorded session", () => {
@@ -180,6 +197,30 @@ describe("check and report on a recorded session", () => {
     expect(bad.stderr).toContain("like 40000, 40k or 1.5m");
   });
 
+  it("check, report and snapshot say when a request was too large to record, instead of skipping it quietly", async () => {
+    const ok = anthropicExchange({
+      messages: [{ role: "user", content: "hi" }],
+      usage: { input: 10 },
+    });
+    const big = anthropicExchange({ messages: [{ role: "user", content: "hi" }] }, 1);
+    big.request = {
+      ...big.request,
+      body: "[truncated: 9437184 bytes]",
+      bytes: 9437184,
+      truncated: true,
+    };
+    const s = session("truncated.jsonl", [ok, big]);
+    for (const cmd of ["check", "report"]) {
+      const r = await cli(cmd, s);
+      expect(r.stdout).toContain("#2 POST anthropic/v1/messages: the request body was 9.0 MB");
+    }
+    const json = JSON.parse((await cli("check", s, "--json")).stdout) as { incomplete: string[] };
+    expect(json.incomplete).toHaveLength(1);
+    const snapped = await cli("snapshot", s, "-o", join(tmp, "truncated.snapshot.json"));
+    expect(snapped.code).toBe(0);
+    expect(snapped.stderr).toContain("the request body was 9.0 MB");
+  });
+
   it("budget accepts 40k", async () => {
     const s = session("budget.jsonl", [
       anthropicExchange({ messages: [{ role: "user", content: "hi" }], usage: { input: 50_000 } }),
@@ -230,6 +271,18 @@ describe("wrap", () => {
   it("propagates the child's exit code when it fails", async () => {
     const r = await cli("wrap", "--no-record", "--", process.execPath, "-e", "process.exit(7)");
     expect(r.code).toBe(7);
+  });
+
+  it("exits 128 + the signal number when the child is killed by a signal", async () => {
+    const r = await cli(
+      "wrap",
+      "--no-record",
+      "--",
+      process.execPath,
+      "-e",
+      "process.kill(process.pid, 'SIGTERM')",
+    );
+    expect(r.code).toBe(143);
   });
 
   it("exits 2 when the command cannot start", async () => {

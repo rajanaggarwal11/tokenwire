@@ -76,6 +76,12 @@ function estimateNote(d: Diff): string {
     : "counts are tokenizer estimates (o200k), calibrated where the provider reported usage";
 }
 
+/** Said next to every dollar figure that rests on a tokenizer estimate. */
+function costCaveat(d: Diff): string {
+  if (d.head.exact && d.base.exact) return "";
+  return "estimated: o200k token counts, which is OpenAI's tokenizer, so Claude models will differ";
+}
+
 /** The PR comment. */
 export function renderDiffMarkdown(d: Diff, title = "what this change sends the model"): string {
   const L: string[] = [COMMENT_MARKER, `### tokenwire · ${title}`, ""];
@@ -132,10 +138,11 @@ export function renderDiffMarkdown(d: Diff, title = "what this change sends the 
 
   if (d.cost) {
     const per = `at $${d.cost.pricePerMTok}/MTok input`;
+    const caveat = costCaveat(d);
     L.push(
-      d.cost.perDayUsd !== undefined
+      (d.cost.perDayUsd !== undefined
         ? `**Cost** ${usd(d.cost.perDayUsd)}/day, ${usd(d.cost.perDayUsd * 30)}/month — ${fmt(d.cost.runsPerDay!)} runs/day ${per}`
-        : `**Cost** ${usd(d.cost.perRunUsd)} per run ${per}`,
+        : `**Cost** ${usd(d.cost.perRunUsd)} per run ${per}`) + (caveat ? ` (${caveat})` : ""),
       "",
     );
   }
@@ -188,12 +195,15 @@ export function renderDiffText(d: Diff): string {
   const marks = { bad: pc.red("✗"), warn: pc.yellow("!"), good: pc.green("✓") };
   for (const line of cacheLines(d)) L.push(`${marks[line.icon]} cache: ${line.text}`);
   for (const w of d.warnings) L.push(`${pc.yellow("!")} ${w}`);
-  if (d.cost)
+  if (d.cost) {
+    const caveat = costCaveat(d);
     L.push(
-      d.cost.perDayUsd !== undefined
+      (d.cost.perDayUsd !== undefined
         ? `  cost ${usd(d.cost.perDayUsd)}/day at ${fmt(d.cost.runsPerDay!)} runs/day, $${d.cost.pricePerMTok}/MTok`
-        : `  cost ${usd(d.cost.perRunUsd)} per run at $${d.cost.pricePerMTok}/MTok`,
+        : `  cost ${usd(d.cost.perRunUsd)} per run at $${d.cost.pricePerMTok}/MTok`) +
+        (caveat ? pc.dim(` (${caveat})`) : ""),
     );
+  }
   L.push("");
   if (d.failures.length) for (const f of d.failures) L.push(`${pc.red("✗")} ${f}`);
   else L.push(pc.green("✓ within limits"));

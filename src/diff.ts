@@ -369,6 +369,12 @@ export function diffSnapshots(base: Snapshot, head: Snapshot, options: DiffOptio
       `the model changed (${base.turns[0]?.model ?? "?"} → ${head.turns[0]?.model ?? "?"}); token counts are not comparable across tokenizers`,
     );
 
+  for (const [label, s] of [
+    ["the baseline", base],
+    ["this run", head],
+  ] as const)
+    for (const m of s.incomplete ?? []) warnings.push(`${label} is missing a request: ${m}`);
+
   const failures: string[] = [];
   for (const x of introduced) failures.push(`this change breaks prompt caching at ${x.where}`);
   if (options.maxIncreasePct !== undefined && pct !== null && pct > options.maxIncreasePct)
